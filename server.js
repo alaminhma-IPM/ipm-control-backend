@@ -508,6 +508,127 @@ app.get('/api/client/me', authMiddleware, async function(req, res) {
   }
 });
 
+// ── CLIENT: CHANGE PASSWORD ───────────────────────────
+app.post('/api/client/change-password', authMiddleware, async function(req, res) {
+  var oldPass = req.body.old_password || '';
+  var newPass = req.body.new_password || '';
+  if (!newPass || newPass.length < 8)
+    return res.status(400).json({ error: 'New password must be at least 8 characters' });
+  try {
+    var result = await getPool().query('SELECT * FROM clients WHERE id=$1', [req.user.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    var valid = await bcrypt.compare(oldPass, result.rows[0].password_hash);
+    if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
+    var hash = await bcrypt.hash(newPass, 10);
+    await getPool().query('UPDATE clients SET password_hash=$1, updated_at=NOW() WHERE id=$2', [hash, req.user.id]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── CLIENT: USERS ─────────────────────────────────────
+app.get('/api/client/users', authMiddleware, async function(req, res) {
+  try {
+    var result = await getPool().query(
+      'SELECT * FROM client_users WHERE client_id=$1 ORDER BY created_at DESC',
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/client/users', authMiddleware, async function(req, res) {
+  var b = req.body;
+  if (!b.username || !b.password)
+    return res.status(400).json({ error: 'Username and password required' });
+  try {
+    var hash = await bcrypt.hash(b.password, 10);
+    var result = await getPool().query(
+      'INSERT INTO client_users (client_id,username,password_hash,full_name,role,department) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+      [req.user.id, b.username, hash, b.full_name||'', b.role||'inspector', b.department||'']
+    );
+    var safe = Object.assign({}, result.rows[0]);
+    delete safe.password_hash;
+    res.json(safe);
+  } catch(e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Username already exists' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.patch('/api/client/users/:id', authMiddleware, async function(req, res) {
+  var b = req.body;
+  try {
+    if (b.password) {
+      var hash = await bcrypt.hash(b.password, 10);
+      await getPool().query(
+        'UPDATE client_users SET password_hash=$1 WHERE id=$2 AND client_id=$3',
+        [hash, req.params.id, req.user.id]
+      );
+    }
+    var result = await getPool().query(
+      'UPDATE client_users SET full_name=COALESCE($1,full_name), role=COALESCE($2,role), department=COALESCE($3,department) WHERE id=$4 AND client_id=$5 RETURNING *',
+      [b.full_name, b.role, b.department, req.params.id, req.user.id]
+    );
+    var safe = Object.assign({}, result.rows[0]);
+    delete safe.password_hash;
+    res.json(safe);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/client/users/:id', authMiddleware, async function(req, res) {
+  try {
+    await getPool().query('DELETE FROM client_users WHERE id=$1 AND client_id=$2', [req.params.id, req.user.id]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── OWNER: UPDATE CLIENT ──────────────────────────────
+app.patch('/api/owner/clients/:id', ownerMiddleware, async function(req, res) {
+  var b = req.body;
+  try {
+    var updates = [];
+    var vals = [];
+    var i = 1;
+    if (b.company_name) { updates.push('company_name=$'+i++); vals.push(b.company_name); }
+    if (b.email)        { updates.push('email=$'+i++);        vals.push(b.email); }
+    if (b.phone)        { updates.push('phone=$'+i++);        vals.push(b.phone); }
+    if (b.plan)         { updates.push('plan=$'+i++);         vals.push(b.plan); }
+    if (b.new_password) {
+      var hash = await bcrypt.hash(b.new_password, 10);
+      updates.push('password_hash=$'+i++); vals.push(hash);
+    }
+    updates.push('updated_at=NOW()');
+    vals.push(req.params.id);
+    var result = await getPool().query(
+      'UPDATE clients SET '+updates.join(',')+' WHERE id=$'+i+' RETURNING *',
+      vals
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    var safe = Object.assign({}, result.rows[0]);
+    delete safe.password_hash;
+    res.json(safe);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── OWNER: STATS WITH CLIENT DETAIL ───────────────────
+app.get('/api/owner/stats', ownerMiddleware, async function(req, res) {
+  try {
+    var c  = await getPool().query("SELECT COUNT(*) AS total, COUNT(*) FILTER(WHERE status='active') AS active, COUNT(*) FILTER(WHERE current_period_end < NOW()) AS expired FROM clients");
+    var cd = await getPool().query('SELECT id,company_name,current_period_end FROM clients ORDER BY current_period_end ASC');
+    var r  = await getPool().query("SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS count FROM payments WHERE status='paid'");
+    var ins = await getPool().query("SELECT COUNT(*) AS total FROM inspections WHERE created_at > NOW()-INTERVAL '30 days'");
+    var a  = await getPool().query("SELECT COUNT(*) AS open FROM corrective_actions WHERE status='Open'");
+    res.json({
+      clients: c.rows[0],
+      clients_detail: cd.rows,
+      revenue: r.rows[0],
+      inspections: ins.rows[0],
+      cas: a.rows[0]
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+
 // ── START ─────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', function() {
   console.log('');
