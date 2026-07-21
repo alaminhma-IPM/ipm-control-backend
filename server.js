@@ -6,7 +6,7 @@ const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+var PORT = parseInt(process.env.PORT) || 3000;
 
 // ── CORS ─────────────────────────────────────────────
 app.use(function(req, res, next) {
@@ -20,16 +20,41 @@ app.use(function(req, res, next) {
 app.use(express.json({ limit: '10mb' }));
 
 // ── DATABASE ──────────────────────────────────────────
-var pool;
-try {
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
-  });
-  console.log('Database pool created');
-} catch(e) {
-  console.error('Database pool error:', e.message);
+// Database connection - lazy initialization
+var pool = null;
+
+function getPool() {
+  if (pool) return pool;
+  var dbUrl = process.env.DATABASE_URL
+           || process.env.DATABASE_PUBLIC_URL
+           || process.env.POSTGRES_URL
+           || process.env.POSTGRESQL_URL;
+
+  if (!dbUrl) {
+    console.error('NO DATABASE URL SET - add DATABASE_URL to Railway Variables');
+    return null;
+  }
+  try {
+    pool = new Pool({ connectionString: dbUrl, ssl: { rejectUnauthorized: false } });
+    console.log('Database pool created OK');
+    return pool;
+  } catch(e) {
+    console.error('Database pool error:', e.message);
+    return null;
+  }
 }
+
+// Test DB connection on startup (non-blocking)
+setTimeout(function() {
+  var p = getPool();
+  if (p) {
+    p.query('SELECT 1').then(function() {
+      console.log('Database connection verified OK');
+    }).catch(function(e) {
+      console.error('Database connection test failed:', e.message);
+    });
+  }
+}, 2000);
 
 // ── CONSTANTS ─────────────────────────────────────────
 var PLANS = {
@@ -132,16 +157,21 @@ app.get('/api/debug/env', function(req, res) {
   var email = process.env.OWNER_EMAIL || 'NOT_SET';
   var pass  = process.env.OWNER_PASSWORD || 'NOT_SET';
   var jwts  = process.env.JWT_SECRET || 'NOT_SET';
-  var db    = process.env.DATABASE_URL || 'NOT_SET';
+  var db      = process.env.DATABASE_URL         || 'NOT_SET';
+  var dbpub   = process.env.DATABASE_PUBLIC_URL   || 'NOT_SET';
+  var dbpost  = process.env.POSTGRES_URL          || 'NOT_SET';
   res.json({
-    OWNER_EMAIL:          email,
-    OWNER_EMAIL_LENGTH:   email.length,
-    OWNER_PASSWORD:       pass === 'NOT_SET' ? 'NOT_SET' : '*'.repeat(pass.length),
+    OWNER_EMAIL:           email,
+    OWNER_EMAIL_LENGTH:    email.length,
+    OWNER_PASSWORD:        pass === 'NOT_SET' ? 'NOT_SET' : '*'.repeat(pass.length),
     OWNER_PASSWORD_LENGTH: pass.length,
-    JWT_SECRET:           jwts === 'NOT_SET' ? 'NOT_SET' : 'SET_(' + jwts.length + '_chars)',
-    DATABASE_URL:         db === 'NOT_SET' ? 'NOT_SET' : 'SET',
-    NODE_ENV:             process.env.NODE_ENV || 'NOT_SET',
-    PORT:                 process.env.PORT || 'NOT_SET'
+    JWT_SECRET:            jwts === 'NOT_SET' ? 'NOT_SET' : 'SET_(' + jwts.length + '_chars)',
+    DATABASE_URL:          db     === 'NOT_SET' ? 'NOT_SET' : 'SET',
+    DATABASE_PUBLIC_URL:   dbpub  === 'NOT_SET' ? 'NOT_SET' : 'SET',
+    POSTGRES_URL:          dbpost === 'NOT_SET' ? 'NOT_SET' : 'SET',
+    NODE_ENV:              process.env.NODE_ENV || 'NOT_SET',
+    PORT:                  process.env.PORT     || 'NOT_SET',
+    ACTIVE_DB:             (db!=='NOT_SET'?'DATABASE_URL':dbpub!=='NOT_SET'?'DATABASE_PUBLIC_URL':dbpost!=='NOT_SET'?'POSTGRES_URL':'NONE_SET')
   });
 });
 
@@ -179,7 +209,8 @@ app.post('/api/owner/login', function(req, res) {
 // ── OWNER: GET ALL CLIENTS ────────────────────────────
 app.get('/api/owner/clients', ownerMiddleware, async function(req, res) {
   try {
-    var result = await pool.query(
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var result = await p.query(
       'SELECT c.*, ' +
       '(SELECT COUNT(*) FROM inspections i WHERE i.client_id=c.id) AS total_inspections, ' +
       '(SELECT COUNT(*) FROM corrective_actions ca WHERE ca.client_id=c.id AND ca.status=\'Open\') AS open_cas, ' +
@@ -206,7 +237,8 @@ app.post('/api/owner/clients', ownerMiddleware, async function(req, res) {
     var lic     = genLicense(b.company_name);
     var expires = new Date(Date.now() + planCfg.days * 86400000);
 
-    var result = await pool.query(
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var result = await p.query(
       'INSERT INTO clients (company_name,contact_name,email,phone,industry,username,password_hash,plan,payment_method,license_key,max_users,max_devices,current_period_end,notes) ' +
       'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *',
       [b.company_name, b.contact_name||'', b.email, b.phone||'', b.industry||'',
@@ -217,7 +249,7 @@ app.post('/api/owner/clients', ownerMiddleware, async function(req, res) {
 
     for (var i = 0; i < DEVICE_SEED.length; i++) {
       var d = DEVICE_SEED[i];
-      await pool.query(
+      await getPool().query(
         'INSERT INTO devices (client_id,device_id,device_type,zone,location) VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING',
         [client.id, d.id, d.type, d.zone, d.location]
       );
@@ -240,7 +272,8 @@ app.patch('/api/owner/clients/:id/renew', ownerMiddleware, async function(req, r
       sql += ', plan=\'' + plan + '\', max_users=' + PLANS[plan].max_users + ', max_devices=' + PLANS[plan].max_devices;
     }
     sql += ' WHERE id=$1 RETURNING *';
-    var result = await pool.query(sql, [req.params.id]);
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var result = await p.query(sql, [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
     res.json(result.rows[0]);
   } catch(e) {
@@ -251,7 +284,7 @@ app.patch('/api/owner/clients/:id/renew', ownerMiddleware, async function(req, r
 // ── OWNER: DELETE CLIENT ──────────────────────────────
 app.delete('/api/owner/clients/:id', ownerMiddleware, async function(req, res) {
   try {
-    await pool.query('DELETE FROM clients WHERE id=$1', [req.params.id]);
+    await getPool().query('DELETE FROM clients WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
   } catch(e) {
     res.status(500).json({ error: e.message });
@@ -261,10 +294,11 @@ app.delete('/api/owner/clients/:id', ownerMiddleware, async function(req, res) {
 // ── OWNER: STATS ──────────────────────────────────────
 app.get('/api/owner/stats', ownerMiddleware, async function(req, res) {
   try {
-    var c = await pool.query('SELECT COUNT(*) AS total, COUNT(*) FILTER(WHERE status=\'active\') AS active, COUNT(*) FILTER(WHERE current_period_end < NOW()) AS expired FROM clients');
-    var r = await pool.query('SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS count FROM payments WHERE status=\'paid\'');
-    var i = await pool.query('SELECT COUNT(*) AS total FROM inspections WHERE created_at > NOW()-INTERVAL \'30 days\'');
-    var a = await pool.query('SELECT COUNT(*) AS open FROM corrective_actions WHERE status=\'Open\'');
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured"});
+    var c = await p.query('SELECT COUNT(*) AS total, COUNT(*) FILTER(WHERE status=\'active\') AS active, COUNT(*) FILTER(WHERE current_period_end < NOW()) AS expired FROM clients');
+    var r = await p.query('SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS count FROM payments WHERE status=\'paid\'');
+    var i = await p.query('SELECT COUNT(*) AS total FROM inspections WHERE created_at > NOW()-INTERVAL \'30 days\'');
+    var a = await p.query('SELECT COUNT(*) AS open FROM corrective_actions WHERE status=\'Open\'');
     res.json({ clients: c.rows[0], revenue: r.rows[0], inspections: i.rows[0], cas: a.rows[0] });
   } catch(e) {
     res.status(500).json({ error: e.message });
@@ -276,12 +310,13 @@ app.post('/api/owner/payments', ownerMiddleware, async function(req, res) {
   var b = req.body;
   var inv = 'INV-' + Date.now().toString(36).toUpperCase();
   try {
-    var result = await pool.query(
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var result = await p.query(
       'INSERT INTO payments (client_id,amount,currency,plan,period_months,method,status,invoice_number,notes,paid_at) VALUES ($1,$2,\'SAR\',$3,$4,\'manual\',\'paid\',$5,$6,NOW()) RETURNING *',
       [b.client_id, b.amount, b.plan, b.period_months||1, inv, b.notes||'']
     );
     var months = b.period_months || 1;
-    await pool.query(
+    await getPool().query(
       'UPDATE clients SET current_period_end=GREATEST(current_period_end,NOW())+INTERVAL \'' + (months*30) + ' days\', plan=$1, updated_at=NOW() WHERE id=$2',
       [b.plan, b.client_id]
     );
@@ -294,7 +329,8 @@ app.post('/api/owner/payments', ownerMiddleware, async function(req, res) {
 // ── OWNER: GET PAYMENTS ───────────────────────────────
 app.get('/api/owner/payments', ownerMiddleware, async function(req, res) {
   try {
-    var result = await pool.query(
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var result = await p.query(
       'SELECT p.*, c.company_name FROM payments p JOIN clients c ON c.id=p.client_id ORDER BY p.created_at DESC LIMIT 100'
     );
     res.json(result.rows);
@@ -308,7 +344,8 @@ app.post('/api/auth/login', async function(req, res) {
   var username = (req.body.username || '').trim();
   var password = req.body.password || '';
   try {
-    var result = await pool.query('SELECT * FROM clients WHERE username=$1', [username]);
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var result = await p.query('SELECT * FROM clients WHERE username=$1', [username]);
     if (!result.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
     var client = result.rows[0];
     var valid = await bcrypt.compare(password, client.password_hash);
@@ -331,7 +368,8 @@ app.post('/api/auth/login', async function(req, res) {
 // ── CLIENT: ME ────────────────────────────────────────
 app.get('/api/client/me', authMiddleware, async function(req, res) {
   try {
-    var result = await pool.query('SELECT * FROM clients WHERE id=$1', [req.user.id]);
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var result = await p.query('SELECT * FROM clients WHERE id=$1', [req.user.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
     var safe = Object.assign({}, result.rows[0]);
     delete safe.password_hash;
@@ -345,7 +383,8 @@ app.get('/api/client/me', authMiddleware, async function(req, res) {
 // ── CLIENT: DEVICES ───────────────────────────────────
 app.get('/api/client/devices', authMiddleware, async function(req, res) {
   try {
-    var result = await pool.query(
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var result = await p.query(
       'SELECT * FROM devices WHERE client_id=$1 AND active=TRUE ORDER BY device_id',
       [req.user.id]
     );
@@ -359,7 +398,8 @@ app.get('/api/client/devices', authMiddleware, async function(req, res) {
 app.get('/api/client/inspections', authMiddleware, async function(req, res) {
   var limit = parseInt(req.query.limit) || 200;
   try {
-    var result = await pool.query(
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var result = await p.query(
       'SELECT * FROM inspections WHERE client_id=$1 ORDER BY created_at DESC LIMIT $2',
       [req.user.id, limit]
     );
@@ -374,7 +414,8 @@ app.post('/api/client/inspections', authMiddleware, async function(req, res) {
   var b = req.body;
   if (!b.device_id || !b.status) return res.status(400).json({ error: 'device_id and status required' });
   try {
-    var result = await pool.query(
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var result = await p.query(
       'INSERT INTO inspections (client_id,device_id,device_type,zone,status,deficiency_type,notes,photo_url,gps_lat,gps_lng,inspector) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
       [req.user.id, b.device_id, b.device_type||'', b.zone||'', b.status,
        b.deficiency_type||null, b.notes||null, b.photo_url||null,
@@ -385,7 +426,7 @@ app.post('/api/client/inspections', authMiddleware, async function(req, res) {
     if (b.status === 'Not Good' && b.deficiency_type) {
       var rule = DEFICIENCY_RULES[b.deficiency_type] || DEFAULT_RULE;
       var due  = new Date(Date.now() + rule.h * 3600000);
-      var caResult = await pool.query(
+      var caResult = await getPool().query(
         'INSERT INTO corrective_actions (client_id,inspection_id,device_id,zone,severity,deficiency_type,department,due_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
         [req.user.id, insp.id, b.device_id, b.zone||'', rule.sev, b.deficiency_type, rule.dept, due]
       );
@@ -400,7 +441,8 @@ app.post('/api/client/inspections', authMiddleware, async function(req, res) {
 // ── CLIENT: CORRECTIVE ACTIONS GET ───────────────────
 app.get('/api/client/corrective-actions', authMiddleware, async function(req, res) {
   try {
-    var result = await pool.query(
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var result = await p.query(
       'SELECT * FROM corrective_actions WHERE client_id=$1 ORDER BY created_at DESC',
       [req.user.id]
     );
@@ -416,7 +458,8 @@ app.patch('/api/client/corrective-actions/:id', authMiddleware, async function(r
   var notes  = req.body.resolution_notes || '';
   var closed = status === 'Closed' ? new Date().toISOString() : null;
   try {
-    var result = await pool.query(
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var result = await p.query(
       'UPDATE corrective_actions SET status=$1,resolution_notes=$2,closed_at=$3 WHERE id=$4 AND client_id=$5 RETURNING *',
       [status, notes, closed, req.params.id, req.user.id]
     );
@@ -430,10 +473,10 @@ app.patch('/api/client/corrective-actions/:id', authMiddleware, async function(r
 app.get('/api/client/dashboard', authMiddleware, async function(req, res) {
   var cid = req.user.id;
   try {
-    var insps   = await pool.query('SELECT status, COUNT(*) AS cnt FROM inspections WHERE client_id=$1 AND created_at>NOW()-INTERVAL \'30 days\' GROUP BY status', [cid]);
-    var cas     = await pool.query('SELECT status, severity, COUNT(*) AS cnt FROM corrective_actions WHERE client_id=$1 GROUP BY status,severity', [cid]);
-    var devices = await pool.query('SELECT COUNT(*) AS cnt FROM devices WHERE client_id=$1 AND active=TRUE', [cid]);
-    var zones   = await pool.query('SELECT zone, COUNT(*) AS total, COUNT(*) FILTER(WHERE status=\'Good\') AS good FROM inspections WHERE client_id=$1 AND created_at>NOW()-INTERVAL \'30 days\' GROUP BY zone', [cid]);
+    var insps   = await getPool().query('SELECT status, COUNT(*) AS cnt FROM inspections WHERE client_id=$1 AND created_at>NOW()-INTERVAL \'30 days\' GROUP BY status', [cid]);
+    var cas     = await getPool().query('SELECT status, severity, COUNT(*) AS cnt FROM corrective_actions WHERE client_id=$1 GROUP BY status,severity', [cid]);
+    var devices = await getPool().query('SELECT COUNT(*) AS cnt FROM devices WHERE client_id=$1 AND active=TRUE', [cid]);
+    var zones   = await getPool().query('SELECT zone, COUNT(*) AS total, COUNT(*) FILTER(WHERE status=\'Good\') AS good FROM inspections WHERE client_id=$1 AND created_at>NOW()-INTERVAL \'30 days\' GROUP BY zone', [cid]);
     var im = {};
     insps.rows.forEach(function(r) { im[r.status] = parseInt(r.cnt); });
     var total = Object.values(im).reduce(function(a,b){ return a+b; }, 0);
@@ -453,7 +496,8 @@ app.get('/api/client/dashboard', authMiddleware, async function(req, res) {
 // ── CLIENT: ME ────────────────────────────────────────
 app.get('/api/client/me', authMiddleware, async function(req, res) {
   try {
-    var result = await pool.query('SELECT * FROM clients WHERE id=$1', [req.user.id]);
+    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var result = await p.query('SELECT * FROM clients WHERE id=$1', [req.user.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
     var safe = Object.assign({}, result.rows[0]);
     delete safe.password_hash;
@@ -465,12 +509,14 @@ app.get('/api/client/me', authMiddleware, async function(req, res) {
 });
 
 // ── START ─────────────────────────────────────────────
-app.listen(PORT, function() {
+app.listen(PORT, '0.0.0.0', function() {
   console.log('');
   console.log('IPM Control API started on port ' + PORT);
   console.log('OWNER_EMAIL:    ' + (process.env.OWNER_EMAIL    ? process.env.OWNER_EMAIL    : 'NOT SET - login will fail'));
   console.log('OWNER_PASSWORD: ' + (process.env.OWNER_PASSWORD ? '*** set ***'               : 'NOT SET - login will fail'));
   console.log('JWT_SECRET:     ' + (process.env.JWT_SECRET     ? '*** set ***'               : 'using default'));
-  console.log('DATABASE_URL:   ' + (process.env.DATABASE_URL   ? 'set'                       : 'NOT SET - DB will fail'));
+  console.log('DATABASE_URL:        ' + (process.env.DATABASE_URL        ? 'SET' : 'not set'));
+  console.log('DATABASE_PUBLIC_URL: ' + (process.env.DATABASE_PUBLIC_URL ? 'SET' : 'not set'));
+  console.log('ACTIVE DB:           ' + (process.env.DATABASE_URL||process.env.DATABASE_PUBLIC_URL ? 'CONNECTED' : 'NONE - DB WILL FAIL'));
   console.log('');
 });
