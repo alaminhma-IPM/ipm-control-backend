@@ -19,7 +19,20 @@ const PORT = process.env.PORT || 5000;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:false });
 
 // ── MIDDLEWARE ────────────────────────────────────────
-app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+app.use(cors({
+  origin: ['http://localhost:3000', 'http://localhost:5500',
+           process.env.FRONTEND_URL || '*',
+           /\.netlify\.app$/, /\.railway\.app$/],
+  credentials: true
+}));
+// Allow all origins in development
+app.use((req,res,next)=>{
+  res.header('Access-Control-Allow-Origin','*');
+  res.header('Access-Control-Allow-Methods','GET,POST,PATCH,DELETE,OPTIONS');
+  res.header('Access-Control-Allow-Headers','Content-Type,Authorization');
+  if(req.method==='OPTIONS')return res.sendStatus(200);
+  next();
+});
 app.use(express.json({ limit:'10mb' }));
 
 const limiter = rateLimit({ windowMs:15*60*1000, max:200 });
