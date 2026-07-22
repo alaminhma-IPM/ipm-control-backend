@@ -192,11 +192,8 @@ app.post('/api/owner/login', function(req, res) {
       error: 'Server config error: OWNER_EMAIL or OWNER_PASSWORD not set in Railway Variables'
     });
   }
-  if (email !== envEmail) {
-    return res.status(401).json({ error: 'Wrong email. Expected: ' + envEmail });
-  }
-  if (password !== envPass) {
-    return res.status(401).json({ error: 'Wrong password' });
+  if (email !== envEmail || password !== envPass) {
+    return res.status(401).json({ error: 'Invalid credentials' });
   }
   try {
     var token = jwt.sign({ role:'owner', email: email }, secret, { expiresIn:'12h' });
