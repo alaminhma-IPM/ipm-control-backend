@@ -323,6 +323,20 @@ app.post('/api/owner/payments', ownerMiddleware, async function(req, res) {
   }
 });
 
+
+// ── OWNER: VIEW CLIENT USERS ──────────────────────
+app.get('/api/owner/client-users/:id', ownerMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var result = await p.query(
+      'SELECT id,username,full_name,role,department,active,created_at FROM client_users WHERE client_id=$1 ORDER BY created_at DESC',
+      [req.params.id]
+    );
+    res.json(result.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── OWNER: GET CLIENT STATS WITH USER COUNT ────────
 // ── OWNER: GET PAYMENTS ───────────────────────────────
 app.get('/api/owner/payments', ownerMiddleware, async function(req, res) {
   try {
@@ -340,25 +354,69 @@ app.get('/api/owner/payments', ownerMiddleware, async function(req, res) {
 app.post('/api/auth/login', async function(req, res) {
   var username = (req.body.username || '').trim();
   var password = req.body.password || '';
+  var secret = process.env.JWT_SECRET || 'IPMControl2026DefaultSecret';
   try {
-    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    var p = getPool();
+    if (!p) return res.status(500).json({ error: 'Database not configured' });
+
+    // 1. Check main clients table
     var result = await p.query('SELECT * FROM clients WHERE username=$1', [username]);
-    if (!result.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
-    var client = result.rows[0];
-    var valid = await bcrypt.compare(password, client.password_hash);
-    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-    if (client.status !== 'active') return res.status(403).json({ error: 'Account suspended' });
-    var days = Math.ceil((new Date(client.current_period_end) - new Date()) / 86400000);
-    var secret = process.env.JWT_SECRET || 'IPMControl2026DefaultSecret';
-    var token = jwt.sign(
-      { id: client.id, username: client.username, role: 'client', plan: client.plan, expired: days <= 0 },
+    if (result.rows.length) {
+      var client = result.rows[0];
+      var valid = await bcrypt.compare(password, client.password_hash);
+      if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+      if (client.status !== 'active') return res.status(403).json({ error: 'Account suspended' });
+      var days = Math.ceil((new Date(client.current_period_end) - new Date()) / 86400000);
+      var token = jwt.sign(
+        { id: client.id, username: client.username, role: client.role || 'admin', plan: client.plan, expired: days <= 0, user_type: 'client_main' },
+        secret, { expiresIn: '24h' }
+      );
+      var safe = Object.assign({}, client);
+      delete safe.password_hash;
+      return res.json({ token: token, client: safe, expired: days <= 0 });
+    }
+
+    // 2. Check client_users table (technicians added by clients)
+    var userResult = await p.query(
+      'SELECT cu.*, c.company_name, c.plan, c.current_period_end, c.status AS client_status, c.license_key ' +
+      'FROM client_users cu JOIN clients c ON c.id = cu.client_id ' +
+      'WHERE cu.username=$1 AND cu.active=TRUE', [username]
+    );
+    if (!userResult.rows.length) return res.status(401).json({ error: 'Invalid credentials' });
+
+    var user = userResult.rows[0];
+    var validUser = await bcrypt.compare(password, user.password_hash);
+    if (!validUser) return res.status(401).json({ error: 'Invalid credentials' });
+    if (user.client_status !== 'active') return res.status(403).json({ error: 'Account suspended' });
+
+    var daysLeft = Math.ceil((new Date(user.current_period_end) - new Date()) / 86400000);
+    var userToken = jwt.sign(
+      { id: user.client_id, username: user.username, role: user.role || 'inspector',
+        plan: user.plan, expired: daysLeft <= 0, user_type: 'sub_user',
+        sub_user_id: user.id, full_name: user.full_name },
       secret, { expiresIn: '24h' }
     );
-    var safe = Object.assign({}, client);
-    delete safe.password_hash;
-    res.json({ token: token, client: safe, expired: days <= 0 });
+
+    return res.json({
+      token: userToken,
+      client: {
+        id: user.client_id,
+        username: user.username,
+        company_name: user.company_name,
+        plan: user.plan,
+        current_period_end: user.current_period_end,
+        license_key: user.license_key,
+        role: user.role,
+        full_name: user.full_name,
+        department: user.department,
+        user_type: 'sub_user'
+      },
+      expired: daysLeft <= 0
+    });
+
   } catch(e) {
-    res.status(500).json({ error: e.message });
+    console.error('Login error:', e.message);
+    res.status(500).json({ error: 'Login failed: ' + e.message });
   }
 });
 
@@ -594,6 +652,8 @@ app.patch('/api/owner/clients/:id', ownerMiddleware, async function(req, res) {
       var hash = await bcrypt.hash(b.new_password, 10);
       updates.push('password_hash=$'+i++); vals.push(hash);
     }
+    if (b.new_username) { updates.push('username=$'+i++); vals.push(b.new_username); }
+    if (b.notes !== undefined) { updates.push('notes=$'+i++); vals.push(b.notes); }
     updates.push('updated_at=NOW()');
     vals.push(req.params.id);
     var result = await getPool().query(
@@ -625,6 +685,55 @@ app.get('/api/owner/stats', ownerMiddleware, async function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+
+
+// ── CLIENT: DOCUMENTS (MSDS + Layout) ────────────
+app.get('/api/client/documents', authMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var result = await p.query(
+      'SELECT * FROM client_documents WHERE client_id=$1 ORDER BY created_at DESC',
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/client/documents', authMiddleware, async function(req, res) {
+  var b = req.body;
+  if (!b.name || !b.doc_type || !b.file_data)
+    return res.status(400).json({ error: 'name, doc_type, and file_data required' });
+  if (!['msds','layout','other'].includes(b.doc_type))
+    return res.status(400).json({ error: 'doc_type must be msds, layout, or other' });
+  try {
+    var p = getPool();
+    var result = await p.query(
+      'INSERT INTO client_documents (client_id, name, doc_type, file_data, file_type, uploaded_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,name,doc_type,file_type,uploaded_by,created_at',
+      [req.user.id, b.name, b.doc_type, b.file_data, b.file_type||'application/pdf', b.uploaded_by||req.user.username]
+    );
+    res.json(result.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/client/documents/:id', authMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var result = await p.query(
+      'SELECT * FROM client_documents WHERE id=$1 AND client_id=$2',
+      [req.params.id, req.user.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/client/documents/:id', authMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    await p.query('DELETE FROM client_documents WHERE id=$1 AND client_id=$2', [req.params.id, req.user.id]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── START ─────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', function() {
