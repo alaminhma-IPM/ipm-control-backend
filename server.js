@@ -449,6 +449,97 @@ app.get('/api/client/devices', authMiddleware, async function(req, res) {
   }
 });
 
+
+// ── CLIENT: DEVICES - SINGLE ADD ─────────────────────
+app.post('/api/client/devices', authMiddleware, async function(req, res) {
+  var b = req.body;
+  if (!b.device_id || !b.device_type) return res.status(400).json({ error: 'device_id and device_type required' });
+  try {
+    var p = getPool();
+    var result = await p.query(
+      'INSERT INTO devices (client_id,device_id,device_type,zone,location) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (client_id,device_id) DO NOTHING RETURNING *',
+      [req.user.id, b.device_id, b.device_type, b.zone||'', b.location||b.zone||'']
+    );
+    res.json(result.rows[0] || { skipped: true, device_id: b.device_id });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── CLIENT: DEVICES - BULK ADD ────────────────────────
+// POST /api/client/devices/bulk
+// Body: { devices: [ { device_id, device_type, location, zone }, ... ] }
+// Returns: { added: N, skipped: N, errors: N, results: [...] }
+app.post('/api/client/devices/bulk', authMiddleware, async function(req, res) {
+  var items = req.body.devices;
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'devices array is required and must not be empty' });
+  }
+  if (items.length > 500) {
+    return res.status(400).json({ error: 'Maximum 500 devices per batch' });
+  }
+
+  var p = getPool();
+  if (!p) return res.status(500).json({ error: 'Database not configured' });
+
+  // Validate each item before inserting
+  for (var i = 0; i < items.length; i++) {
+    if (!items[i].device_id || !items[i].device_type) {
+      return res.status(400).json({
+        error: 'Each device must have device_id and device_type',
+        bad_index: i,
+        bad_item: items[i]
+      });
+    }
+  }
+
+  var added = 0;
+  var skipped = 0;
+  var errors = 0;
+  var results = [];
+
+  // Use a transaction for atomicity
+  var client = await p.connect();
+  try {
+    await client.query('BEGIN');
+
+    for (var j = 0; j < items.length; j++) {
+      var d = items[j];
+      try {
+        var r = await client.query(
+          'INSERT INTO devices (client_id, device_id, device_type, zone, location) ' +
+          'VALUES ($1, $2, $3, $4, $5) ' +
+          'ON CONFLICT (client_id, device_id) DO NOTHING RETURNING device_id',
+          [req.user.id, d.device_id, d.device_type, d.zone||d.location||'', d.location||d.zone||'']
+        );
+        if (r.rows.length > 0) {
+          added++;
+          results.push({ device_id: d.device_id, status: 'added' });
+        } else {
+          skipped++;
+          results.push({ device_id: d.device_id, status: 'skipped', reason: 'already exists' });
+        }
+      } catch(itemErr) {
+        errors++;
+        results.push({ device_id: d.device_id, status: 'error', reason: itemErr.message });
+      }
+    }
+
+    await client.query('COMMIT');
+    res.json({
+      success: true,
+      total:   items.length,
+      added:   added,
+      skipped: skipped,
+      errors:  errors,
+      results: results
+    });
+  } catch(txErr) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: 'Transaction failed: ' + txErr.message });
+  } finally {
+    client.release();
+  }
+});
+
 // ── CLIENT: INSPECTIONS GET ───────────────────────────
 app.get('/api/client/inspections', authMiddleware, async function(req, res) {
   var limit = parseInt(req.query.limit) || 200;
