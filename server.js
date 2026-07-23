@@ -456,7 +456,7 @@ app.delete('/api/client/devices/all', authMiddleware, async function(req, res) {
   try {
     var p = getPool();
     var result = await p.query(
-      'DELETE FROM devices WHERE client_id=$1 RETURNING COUNT(*)',
+      'DELETE FROM devices WHERE client_id=$1',
       [req.user.id]
     );
     res.json({ ok: true, deleted: result.rowCount });
