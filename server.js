@@ -450,6 +450,91 @@ app.get('/api/client/devices', authMiddleware, async function(req, res) {
 });
 
 
+
+// ── CLIENT: DELETE ALL DEVICES (reset before new batch) ──
+app.delete('/api/client/devices/all', authMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var result = await p.query(
+      'DELETE FROM devices WHERE client_id=$1 RETURNING COUNT(*)',
+      [req.user.id]
+    );
+    res.json({ ok: true, deleted: result.rowCount });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── CLIENT: DELETE SINGLE DEVICE ──────────────────────
+app.delete('/api/client/devices/:id', authMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    await p.query(
+      'DELETE FROM devices WHERE id=$1 AND client_id=$2',
+      [req.params.id, req.user.id]
+    );
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── CLIENT: INSPECTION TOURS + SIGNATURES ─────────────
+// GET all tours
+app.get('/api/client/tours', authMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var result = await p.query(
+      'SELECT * FROM inspection_tours WHERE client_id=$1 ORDER BY created_at DESC LIMIT 100',
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET single tour with inspections
+app.get('/api/client/tours/:id', authMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var tour = await p.query(
+      "SELECT * FROM inspection_tours WHERE id=$1 AND client_id=$2",
+      [req.params.id, req.user.id]
+    );
+    if (!tour.rows.length) return res.status(404).json({ error: 'Tour not found' });
+    var insps = await p.query(
+      "SELECT * FROM inspections WHERE tour_id=$1 ORDER BY created_at",
+      [req.params.id]
+    );
+    res.json({ tour: tour.rows[0], inspections: insps.rows });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST create new tour (start)
+app.post('/api/client/tours', authMiddleware, async function(req, res) {
+  var b = req.body;
+  try {
+    var p = getPool();
+    var result = await p.query(
+      "INSERT INTO inspection_tours (client_id, tour_name, zone, started_by, status) VALUES ($1,$2,$3,$4,'in_progress') RETURNING *",
+      [req.user.id, b.tour_name||'Plant Inspection Tour', b.zone||'', b.started_by||req.user.username]
+    );
+    res.json(result.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH complete tour + capture signature
+app.patch('/api/client/tours/:id/complete', authMiddleware, async function(req, res) {
+  var b = req.body;
+  if (!b.signature_data) return res.status(400).json({ error: 'signature_data is required' });
+  try {
+    var p = getPool();
+    // Get tour inspection count
+    var count = await p.query("SELECT COUNT(*) AS cnt FROM inspections WHERE tour_id=$1", [req.params.id]);
+    var result = await p.query(
+      "UPDATE inspection_tours SET status=$1, completed_at=NOW(), area_leader_name=$2, area_leader_signature=$3, total_inspections=$4, updated_at=NOW() WHERE id=$5 AND client_id=$6 RETURNING *",
+      ['completed', b.area_leader_name||'', b.signature_data, parseInt(count.rows[0].cnt), req.params.id, req.user.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Tour not found' });
+    res.json(result.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── CLIENT: DEVICES - SINGLE ADD ─────────────────────
 app.post('/api/client/devices', authMiddleware, async function(req, res) {
   var b = req.body;
@@ -562,10 +647,10 @@ app.post('/api/client/inspections', authMiddleware, async function(req, res) {
   try {
     var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
     var result = await p.query(
-      'INSERT INTO inspections (client_id,device_id,device_type,zone,status,deficiency_type,notes,photo_url,gps_lat,gps_lng,inspector) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',
+      'INSERT INTO inspections (client_id,device_id,device_type,zone,status,deficiency_type,notes,photo_url,gps_lat,gps_lng,inspector,tour_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *',
       [req.user.id, b.device_id, b.device_type||'', b.zone||'', b.status,
        b.deficiency_type||null, b.notes||null, b.photo_url||null,
-       b.gps_lat||null, b.gps_lng||null, b.inspector||'']
+       b.gps_lat||null, b.gps_lng||null, b.inspector||'', b.tour_id||null]
     );
     var insp = result.rows[0];
     var ca = null;
