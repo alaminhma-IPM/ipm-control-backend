@@ -129,6 +129,15 @@ function checkPasswordStrength(pw) {
   return null;
 }
 
+
+// ── RBAC: block technicians (sub-users) from admin actions ──
+function mainAccountOnly(req, res, next) {
+  if (req.user && req.user.user_type === 'sub_user') {
+    return res.status(403).json({ error: 'Technicians cannot perform this action. Contact your account administrator.' });
+  }
+  next();
+}
+
 function authMiddleware(req, res, next) {
   var header = req.headers.authorization || '';
   var token = header.split(' ')[1];
@@ -465,7 +474,7 @@ app.get('/api/client/devices', authMiddleware, async function(req, res) {
 
 
 // ── CLIENT: DELETE ALL DEVICES (reset before new batch) ──
-app.delete('/api/client/devices/all', authMiddleware, async function(req, res) {
+app.delete('/api/client/devices/all', authMiddleware, mainAccountOnly, async function(req, res) {
   try {
     var p = getPool();
     var result = await p.query(
@@ -477,7 +486,7 @@ app.delete('/api/client/devices/all', authMiddleware, async function(req, res) {
 });
 
 // ── CLIENT: DELETE SINGLE DEVICE ──────────────────────
-app.delete('/api/client/devices/:id', authMiddleware, async function(req, res) {
+app.delete('/api/client/devices/:id', authMiddleware, mainAccountOnly, async function(req, res) {
   try {
     var p = getPool();
     await p.query(
@@ -542,16 +551,44 @@ app.patch('/api/client/tours/:id/complete', authMiddleware, async function(req, 
     // Get tour inspection count
     var count = await p.query("SELECT COUNT(*) AS cnt FROM inspections WHERE tour_id=$1", [req.params.id]);
     var result = await p.query(
-      "UPDATE inspection_tours SET status=$1, completed_at=NOW(), area_leader_name=$2, area_leader_signature=$3, total_inspections=$4, updated_at=NOW() WHERE id=$5 AND client_id=$6 RETURNING *",
-      ['completed', b.area_leader_name||'', b.signature_data, parseInt(count.rows[0].cnt), req.params.id, req.user.id]
+      "UPDATE inspection_tours SET status=$1, completed_at=NOW(), area_leader_name=$2, area_leader_signature=$3, total_inspections=$4, customer_comments=$5, updated_at=NOW() WHERE id=$6 AND client_id=$7 RETURNING *",
+      ['completed', b.area_leader_name||'', b.signature_data, parseInt(count.rows[0].cnt), b.customer_comments||'', req.params.id, req.user.id]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Tour not found' });
     res.json(result.rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// ── CHEMICAL APPLICATION LOG ──────────────────────────
+app.get('/api/client/chemicals', authMiddleware, async function(req, res) {
+  try {
+    var result = await getPool().query(
+      'SELECT * FROM chemical_applications WHERE client_id=$1 ORDER BY created_at DESC LIMIT 200',
+      [req.user.id]
+    );
+    res.json(result.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/client/chemicals', authMiddleware, async function(req, res) {
+  var b = req.body;
+  if (!b.product) return res.status(400).json({ error: 'Product name is required' });
+  try {
+    var result = await getPool().query(
+      'INSERT INTO chemical_applications (client_id,tour_id,product,registration_no,batch_no,quantity,concentration,application_method,target_pest,treatment_area,ppe_used,weather,notes,applied_by) ' +
+      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *',
+      [req.user.id, b.tour_id||null, b.product, b.registration_no||'', b.batch_no||'',
+       b.quantity||'', b.concentration||'', b.application_method||'', b.target_pest||'',
+       b.treatment_area||'', b.ppe_used||'', b.weather||'', b.notes||'',
+       b.applied_by || (req.user.full_name ? req.user.full_name + ' (' + req.user.username + ')' : req.user.username)]
+    );
+    res.json(result.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── CLIENT: DEVICES - SINGLE ADD ─────────────────────
-app.post('/api/client/devices', authMiddleware, async function(req, res) {
+app.post('/api/client/devices', authMiddleware, mainAccountOnly, async function(req, res) {
   var b = req.body;
   if (!b.device_id || !b.device_type) return res.status(400).json({ error: 'device_id and device_type required' });
   try {
@@ -568,7 +605,7 @@ app.post('/api/client/devices', authMiddleware, async function(req, res) {
 // POST /api/client/devices/bulk
 // Body: { devices: [ { device_id, device_type, location, zone }, ... ] }
 // Returns: { added: N, skipped: N, errors: N, results: [...] }
-app.post('/api/client/devices/bulk', authMiddleware, async function(req, res) {
+app.post('/api/client/devices/bulk', authMiddleware, mainAccountOnly, async function(req, res) {
   var items = req.body.devices;
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'devices array is required and must not be empty' });
@@ -661,11 +698,17 @@ app.post('/api/client/inspections', authMiddleware, async function(req, res) {
   if (!b.device_id || !b.status) return res.status(400).json({ error: 'device_id and status required' });
   try {
     var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    // Offline dedupe: skip if this offline_key already synced
+    if (b.offline_key) {
+      var dup = await p.query('SELECT id FROM inspections WHERE client_id=$1 AND offline_key=$2', [req.user.id, b.offline_key]);
+      if (dup.rows.length) return res.json(Object.assign({duplicate:true}, dup.rows[0]));
+    }
     var result = await p.query(
-      'INSERT INTO inspections (client_id,device_id,device_type,zone,status,deficiency_type,notes,photo_url,gps_lat,gps_lng,inspector,tour_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *',
+      'INSERT INTO inspections (client_id,device_id,device_type,zone,status,deficiency_type,notes,photo_url,gps_lat,gps_lng,inspector,tour_id,findings,offline_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *',
       [req.user.id, b.device_id, b.device_type||'', b.zone||'', b.status,
        b.deficiency_type||null, b.notes||null, b.photo_url||null,
-       b.gps_lat||null, b.gps_lng||null, b.inspector||'', b.tour_id||null]
+       b.gps_lat||null, b.gps_lng||null, b.inspector||'', b.tour_id||null,
+       b.findings ? JSON.stringify(b.findings) : null, b.offline_key||null]
     );
     var insp = result.rows[0];
     var ca = null;
@@ -758,9 +801,19 @@ app.get('/api/client/me', authMiddleware, async function(req, res) {
 app.post('/api/client/change-password', authMiddleware, async function(req, res) {
   var oldPass = req.body.old_password || '';
   var newPass = req.body.new_password || '';
-  if (!newPass || newPass.length < 8)
-    return res.status(400).json({ error: 'New password must be at least 8 characters' });
+  var pwErrCp = checkPasswordStrength(newPass);
+  if (pwErrCp) return res.status(400).json({ error: pwErrCp });
   try {
+    // Technicians change their own password in client_users
+    if (req.user.user_type === 'sub_user') {
+      var su = await getPool().query('SELECT * FROM client_users WHERE id=$1', [req.user.sub_user_id]);
+      if (!su.rows.length) return res.status(404).json({ error: 'User not found' });
+      var okSu = await bcrypt.compare(oldPass, su.rows[0].password_hash);
+      if (!okSu) return res.status(401).json({ error: 'Current password is incorrect' });
+      var newHashSu = await bcrypt.hash(newPass, 10);
+      await getPool().query('UPDATE client_users SET password_hash=$1 WHERE id=$2', [newHashSu, req.user.sub_user_id]);
+      return res.json({ ok: true });
+    }
     var result = await getPool().query('SELECT * FROM clients WHERE id=$1', [req.user.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
     var valid = await bcrypt.compare(oldPass, result.rows[0].password_hash);
@@ -782,7 +835,7 @@ app.get('/api/client/users', authMiddleware, async function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/client/users', authMiddleware, async function(req, res) {
+app.post('/api/client/users', authMiddleware, mainAccountOnly, async function(req, res) {
   var b = req.body;
   if (!b.username || !b.password)
     return res.status(400).json({ error: 'Username and password required' });
@@ -812,7 +865,7 @@ app.post('/api/client/users', authMiddleware, async function(req, res) {
   }
 });
 
-app.patch('/api/client/users/:id', authMiddleware, async function(req, res) {
+app.patch('/api/client/users/:id', authMiddleware, mainAccountOnly, async function(req, res) {
   var b = req.body;
   if (b.new_password) {
     var pwE = checkPasswordStrength(b.new_password);
@@ -836,7 +889,7 @@ app.patch('/api/client/users/:id', authMiddleware, async function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/client/users/:id', authMiddleware, async function(req, res) {
+app.delete('/api/client/users/:id', authMiddleware, mainAccountOnly, async function(req, res) {
   try {
     await getPool().query('DELETE FROM client_users WHERE id=$1 AND client_id=$2', [req.params.id, req.user.id]);
     res.json({ ok: true });
@@ -906,7 +959,7 @@ app.get('/api/client/documents', authMiddleware, async function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/client/documents', authMiddleware, async function(req, res) {
+app.post('/api/client/documents', authMiddleware, mainAccountOnly, async function(req, res) {
   var b = req.body;
   if (!b.name || !b.doc_type || !b.file_data)
     return res.status(400).json({ error: 'name, doc_type, and file_data required' });
@@ -934,7 +987,7 @@ app.get('/api/client/documents/:id', authMiddleware, async function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/client/documents/:id', authMiddleware, async function(req, res) {
+app.delete('/api/client/documents/:id', authMiddleware, mainAccountOnly, async function(req, res) {
   try {
     var p = getPool();
     await p.query('DELETE FROM client_documents WHERE id=$1 AND client_id=$2', [req.params.id, req.user.id]);
