@@ -613,12 +613,13 @@ app.post('/api/client/chemicals', authMiddleware, async function(req, res) {
   if (!b.product) return res.status(400).json({ error: 'Product name is required' });
   try {
     var result = await getPool().query(
-      'INSERT INTO chemical_applications (client_id,tour_id,product,registration_no,batch_no,quantity,concentration,application_method,target_pest,treatment_area,ppe_used,weather,notes,applied_by) ' +
-      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *',
+      'INSERT INTO chemical_applications (client_id,tour_id,product,registration_no,batch_no,quantity,concentration,application_method,target_pest,treatment_area,ppe_used,weather,notes,applied_by,photo_url) ' +
+      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *',
       [req.user.id, b.tour_id||null, b.product, b.registration_no||'', b.batch_no||'',
        b.quantity||'', b.concentration||'', b.application_method||'', b.target_pest||'',
        b.treatment_area||'', b.ppe_used||'', b.weather||'', b.notes||'',
-       b.applied_by || (req.user.full_name ? req.user.full_name + ' (' + req.user.username + ')' : req.user.username)]
+       b.applied_by || (req.user.full_name ? req.user.full_name + ' (' + req.user.username + ')' : req.user.username),
+       b.photo_url || null]
     );
     res.json(result.rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
