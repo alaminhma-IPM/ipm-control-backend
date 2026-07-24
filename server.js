@@ -1030,6 +1030,52 @@ app.patch('/api/owner/clients/:id', ownerMiddleware, async function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// ── OWNER: CLIENT CONTRACTS ────────────────────────────
+// List contracts for a client
+app.get('/api/owner/clients/:id/contracts', ownerMiddleware, async function(req, res) {
+  try {
+    var result = await getPool().query(
+      'SELECT id,client_id,title,file_type,file_name,contract_start,contract_end,status,notes,uploaded_by,created_at ' +
+      'FROM client_contracts WHERE client_id=$1 ORDER BY created_at DESC',
+      [req.params.id]
+    );
+    res.json(result.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Get single contract (includes file_data for viewing/downloading)
+app.get('/api/owner/contracts/:id', ownerMiddleware, async function(req, res) {
+  try {
+    var result = await getPool().query('SELECT * FROM client_contracts WHERE id=$1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Contract not found' });
+    res.json(result.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Upload a new contract for a client
+app.post('/api/owner/clients/:id/contracts', ownerMiddleware, async function(req, res) {
+  var b = req.body;
+  if (!b.title || !b.file_data) return res.status(400).json({ error: 'Title and file are required' });
+  try {
+    var result = await getPool().query(
+      'INSERT INTO client_contracts (client_id,title,file_data,file_type,file_name,contract_start,contract_end,status,notes,uploaded_by) ' +
+      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id,client_id,title,file_type,file_name,contract_start,contract_end,status,notes,uploaded_by,created_at',
+      [req.params.id, b.title, b.file_data, b.file_type||'application/pdf', b.file_name||'',
+       b.contract_start||null, b.contract_end||null, b.status||'active', b.notes||'', b.uploaded_by||'Owner']
+    );
+    res.json(result.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Delete a contract
+app.delete('/api/owner/contracts/:id', ownerMiddleware, async function(req, res) {
+  try {
+    await getPool().query('DELETE FROM client_contracts WHERE id=$1', [req.params.id]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── OWNER: STATS WITH CLIENT DETAIL ───────────────────
 app.get('/api/owner/stats', ownerMiddleware, async function(req, res) {
   try {
