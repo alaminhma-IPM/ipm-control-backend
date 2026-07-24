@@ -400,7 +400,7 @@ app.post('/api/auth/login', async function(req, res) {
 
     // 2. Check client_users table (technicians added by clients)
     var userResult = await p.query(
-      'SELECT cu.*, c.company_name, c.plan, c.current_period_end, c.status AS client_status, c.license_key ' +
+      'SELECT cu.*, c.company_name, c.plan, c.current_period_end, c.status AS client_status, c.license_key, c.logo_url, c.country ' +
       'FROM client_users cu JOIN clients c ON c.id = cu.client_id ' +
       'WHERE cu.username=$1 AND cu.active=TRUE', [username]
     );
@@ -431,7 +431,9 @@ app.post('/api/auth/login', async function(req, res) {
         role: user.role,
         full_name: user.full_name,
         department: user.department,
-        user_type: 'sub_user'
+        user_type: 'sub_user',
+        logo_url: user.logo_url,
+        country: user.country
       },
       expired: daysLeft <= 0
     });
