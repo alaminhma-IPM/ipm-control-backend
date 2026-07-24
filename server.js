@@ -58,7 +58,7 @@ setTimeout(function() {
 
 // ── CONSTANTS ─────────────────────────────────────────
 var PLANS = {
-  trial:        { days: 7,   price: 0,   max_users: 5,   max_devices: 30  },
+  trial:        { days: 3,   price: 0,   max_users: 5,   max_devices: 30  },
   basic:        { days: 30,  price: 299,  max_users: 10,  max_devices: 50  },
   professional: { days: 30,  price: 599,  max_users: 25,  max_devices: 100 },
   enterprise:   { days: 30,  price: 999,  max_users: 999, max_devices: 999 }
