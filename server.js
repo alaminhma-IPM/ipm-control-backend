@@ -502,11 +502,23 @@ app.delete('/api/client/devices/:id', authMiddleware, mainAccountOnly, async fun
 app.get('/api/client/tours', authMiddleware, async function(req, res) {
   try {
     var p = getPool();
-    var result = await p.query(
-      'SELECT t.*, (SELECT COUNT(*) FROM inspections i WHERE i.tour_id = t.id) AS live_inspection_count ' +
-      'FROM inspection_tours t WHERE t.client_id=$1 ORDER BY t.created_at DESC LIMIT 100',
-      [req.user.id]
-    );
+    var result;
+    if (req.user.user_type === 'sub_user') {
+      // Technicians only see tours they started or where they logged at least one inspection
+      result = await p.query(
+        'SELECT t.*, (SELECT COUNT(*) FROM inspections i WHERE i.tour_id = t.id) AS live_inspection_count ' +
+        'FROM inspection_tours t WHERE t.client_id=$1 AND ' +
+        '(t.started_by=$2 OR EXISTS (SELECT 1 FROM inspections i WHERE i.tour_id = t.id AND i.sub_user_id=$3)) ' +
+        'ORDER BY t.created_at DESC LIMIT 100',
+        [req.user.id, req.user.username, req.user.sub_user_id]
+      );
+    } else {
+      result = await p.query(
+        'SELECT t.*, (SELECT COUNT(*) FROM inspections i WHERE i.tour_id = t.id) AS live_inspection_count ' +
+        'FROM inspection_tours t WHERE t.client_id=$1 ORDER BY t.created_at DESC LIMIT 100',
+        [req.user.id]
+      );
+    }
     result.rows.forEach(function(r) { r.total_inspections = parseInt(r.live_inspection_count) || 0; });
     res.json(result.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -521,6 +533,22 @@ app.get('/api/client/tours/:id', authMiddleware, async function(req, res) {
       [req.params.id, req.user.id]
     );
     if (!tour.rows.length) return res.status(404).json({ error: 'Tour not found' });
+    if (req.user.user_type === 'sub_user') {
+      var access = await p.query(
+        'SELECT 1 FROM inspections WHERE tour_id=$1 AND sub_user_id=$2 LIMIT 1',
+        [req.params.id, req.user.sub_user_id]
+      );
+      var isStarter = tour.rows[0].started_by === req.user.username;
+      if (!access.rows.length && !isStarter) {
+        return res.status(403).json({ error: 'You do not have access to this tour' });
+      }
+      // Show only their own inspections within the tour
+      var insps2 = await p.query(
+        "SELECT * FROM inspections WHERE tour_id=$1 AND sub_user_id=$2 ORDER BY created_at",
+        [req.params.id, req.user.sub_user_id]
+      );
+      return res.json({ tour: tour.rows[0], inspections: insps2.rows });
+    }
     var insps = await p.query(
       "SELECT * FROM inspections WHERE tour_id=$1 ORDER BY created_at",
       [req.params.id]
@@ -563,10 +591,19 @@ app.patch('/api/client/tours/:id/complete', authMiddleware, async function(req, 
 // ── CHEMICAL APPLICATION LOG ──────────────────────────
 app.get('/api/client/chemicals', authMiddleware, async function(req, res) {
   try {
-    var result = await getPool().query(
-      'SELECT * FROM chemical_applications WHERE client_id=$1 ORDER BY created_at DESC LIMIT 200',
-      [req.user.id]
-    );
+    var result;
+    if (req.user.user_type === 'sub_user') {
+      var myName = req.user.full_name ? req.user.full_name + ' (' + req.user.username + ')' : req.user.username;
+      result = await getPool().query(
+        'SELECT * FROM chemical_applications WHERE client_id=$1 AND applied_by=$2 ORDER BY created_at DESC LIMIT 200',
+        [req.user.id, myName]
+      );
+    } else {
+      result = await getPool().query(
+        'SELECT * FROM chemical_applications WHERE client_id=$1 ORDER BY created_at DESC LIMIT 200',
+        [req.user.id]
+      );
+    }
     res.json(result.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -682,10 +719,19 @@ app.get('/api/client/inspections', authMiddleware, async function(req, res) {
   var limit = parseInt(req.query.limit) || 200;
   try {
     var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
-    var result = await p.query(
-      'SELECT * FROM inspections WHERE client_id=$1 ORDER BY created_at DESC LIMIT $2',
-      [req.user.id, limit]
-    );
+    var result;
+    if (req.user.user_type === 'sub_user') {
+      // Technicians only see their own submissions
+      result = await p.query(
+        'SELECT * FROM inspections WHERE client_id=$1 AND sub_user_id=$2 ORDER BY created_at DESC LIMIT $3',
+        [req.user.id, req.user.sub_user_id, limit]
+      );
+    } else {
+      result = await p.query(
+        'SELECT * FROM inspections WHERE client_id=$1 ORDER BY created_at DESC LIMIT $2',
+        [req.user.id, limit]
+      );
+    }
     res.json(result.rows);
   } catch(e) {
     res.status(500).json({ error: e.message });
@@ -704,11 +750,12 @@ app.post('/api/client/inspections', authMiddleware, async function(req, res) {
       if (dup.rows.length) return res.json(Object.assign({duplicate:true}, dup.rows[0]));
     }
     var result = await p.query(
-      'INSERT INTO inspections (client_id,device_id,device_type,zone,status,deficiency_type,notes,photo_url,gps_lat,gps_lng,inspector,tour_id,findings,offline_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *',
+      'INSERT INTO inspections (client_id,device_id,device_type,zone,status,deficiency_type,notes,photo_url,gps_lat,gps_lng,inspector,tour_id,findings,offline_key,sub_user_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *',
       [req.user.id, b.device_id, b.device_type||'', b.zone||'', b.status,
        b.deficiency_type||null, b.notes||null, b.photo_url||null,
        b.gps_lat||null, b.gps_lng||null, b.inspector||'', b.tour_id||null,
-       b.findings ? JSON.stringify(b.findings) : null, b.offline_key||null]
+       b.findings ? JSON.stringify(b.findings) : null, b.offline_key||null,
+       req.user.user_type === 'sub_user' ? req.user.sub_user_id : null]
     );
     var insp = result.rows[0];
     var ca = null;
@@ -731,10 +778,21 @@ app.post('/api/client/inspections', authMiddleware, async function(req, res) {
 app.get('/api/client/corrective-actions', authMiddleware, async function(req, res) {
   try {
     var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
-    var result = await p.query(
-      'SELECT * FROM corrective_actions WHERE client_id=$1 ORDER BY created_at DESC',
-      [req.user.id]
-    );
+    var result;
+    if (req.user.user_type === 'sub_user') {
+      // Technicians only see CAs generated from their own inspections
+      result = await p.query(
+        'SELECT ca.* FROM corrective_actions ca ' +
+        'JOIN inspections i ON i.id = ca.inspection_id ' +
+        'WHERE ca.client_id=$1 AND i.sub_user_id=$2 ORDER BY ca.created_at DESC',
+        [req.user.id, req.user.sub_user_id]
+      );
+    } else {
+      result = await p.query(
+        'SELECT * FROM corrective_actions WHERE client_id=$1 ORDER BY created_at DESC',
+        [req.user.id]
+      );
+    }
     res.json(result.rows);
   } catch(e) {
     res.status(500).json({ error: e.message });
