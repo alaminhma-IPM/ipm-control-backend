@@ -258,11 +258,11 @@ app.post('/api/owner/clients', ownerMiddleware, async function(req, res) {
 
     var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
     var result = await p.query(
-      'INSERT INTO clients (company_name,contact_name,email,phone,industry,username,password_hash,plan,payment_method,license_key,max_users,max_devices,current_period_end,notes) ' +
-      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *',
-      [b.company_name, b.contact_name||'', b.email, b.phone||'', b.industry||'',
+      'INSERT INTO clients (company_name,contact_name,email,phone,industry,country,username,password_hash,plan,payment_method,license_key,max_users,max_devices,current_period_end,notes,logo_url) ' +
+      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *',
+      [b.company_name, b.contact_name||'', b.email, b.phone||'', b.industry||'', b.country||'Saudi Arabia',
        b.username, hash, b.plan, b.payment_method||'manual',
-       lic, (parseInt(b.max_users) > 0 ? parseInt(b.max_users) : planCfg.max_users), planCfg.max_devices, expires, b.notes||'']
+       lic, (parseInt(b.max_users) > 0 ? parseInt(b.max_users) : planCfg.max_users), planCfg.max_devices, expires, b.notes||'', b.logo_url||null]
     );
     var client = result.rows[0];
 
@@ -973,6 +973,8 @@ app.patch('/api/owner/clients/:id', ownerMiddleware, async function(req, res) {
     if (b.new_username) { updates.push('username=$'+i++); vals.push(b.new_username); }
     if (b.notes !== undefined) { updates.push('notes=$'+i++); vals.push(b.notes); }
     if (parseInt(b.max_users) > 0) { updates.push('max_users=$'+i++); vals.push(parseInt(b.max_users)); }
+    if (b.country)      { updates.push('country=$'+i++);      vals.push(b.country); }
+    if (b.logo_url !== undefined) { updates.push('logo_url=$'+i++); vals.push(b.logo_url); }
     updates.push('updated_at=NOW()');
     vals.push(req.params.id);
     var result = await getPool().query(
