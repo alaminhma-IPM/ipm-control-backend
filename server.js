@@ -625,6 +625,46 @@ app.post('/api/client/chemicals', authMiddleware, async function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// ── OWNER: FULL SYSTEM BACKUP (export all tables as JSON) ──
+app.get('/api/owner/backup', ownerMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    if (!p) return res.status(500).json({ error: 'Database not configured' });
+
+    var tables = [
+      'clients', 'client_users', 'client_documents', 'devices',
+      'inspections', 'corrective_actions', 'inspection_tours',
+      'chemical_applications', 'payments', 'audit_log'
+    ];
+
+    var backup = {
+      backup_version: '1.0',
+      system: 'APQS IPM',
+      generated_at: new Date().toISOString(),
+      tables: {}
+    };
+
+    for (var i = 0; i < tables.length; i++) {
+      var t = tables[i];
+      try {
+        var result = await p.query('SELECT * FROM ' + t);
+        backup.tables[t] = result.rows;
+      } catch (tableErr) {
+        // Table may not exist on older DBs — skip gracefully
+        backup.tables[t] = { error: 'Table not found or inaccessible: ' + tableErr.message };
+      }
+    }
+
+    var filename = 'apqs-ipm-backup-' + new Date().toISOString().slice(0,10) + '.json';
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', 'attachment; filename="' + filename + '"');
+    res.send(JSON.stringify(backup, null, 2));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── CLIENT: DEVICES - SINGLE ADD ─────────────────────
 app.post('/api/client/devices', authMiddleware, mainAccountOnly, async function(req, res) {
   var b = req.body;
