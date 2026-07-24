@@ -119,6 +119,16 @@ function genLicense(name) {
   return 'IPM-' + safe + '-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).slice(2,6).toUpperCase();
 }
 
+
+// ── PASSWORD STRENGTH CHECK ───────────────────────────
+function checkPasswordStrength(pw) {
+  if (!pw || pw.length < 8) return 'Password must be at least 8 characters';
+  if (!/[A-Z]/.test(pw)) return 'Password must contain an uppercase letter';
+  if (!/[a-z]/.test(pw)) return 'Password must contain a lowercase letter';
+  if (!/[0-9]/.test(pw)) return 'Password must contain a number';
+  return null;
+}
+
 function authMiddleware(req, res, next) {
   var header = req.headers.authorization || '';
   var token = header.split(' ')[1];
@@ -229,6 +239,9 @@ app.post('/api/owner/clients', ownerMiddleware, async function(req, res) {
   var planCfg = PLANS[b.plan];
   if (!planCfg) return res.status(400).json({ error: 'Invalid plan' });
 
+  var pwErrC = checkPasswordStrength(b.password);
+  if (pwErrC) return res.status(400).json({ error: pwErrC });
+
   try {
     var hash    = await bcrypt.hash(b.password, 10);
     var lic     = genLicense(b.company_name);
@@ -240,7 +253,7 @@ app.post('/api/owner/clients', ownerMiddleware, async function(req, res) {
       'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *',
       [b.company_name, b.contact_name||'', b.email, b.phone||'', b.industry||'',
        b.username, hash, b.plan, b.payment_method||'manual',
-       lic, planCfg.max_users, planCfg.max_devices, expires, b.notes||'']
+       lic, (parseInt(b.max_users) > 0 ? parseInt(b.max_users) : planCfg.max_users), planCfg.max_devices, expires, b.notes||'']
     );
     var client = result.rows[0];
 
@@ -481,9 +494,11 @@ app.get('/api/client/tours', authMiddleware, async function(req, res) {
   try {
     var p = getPool();
     var result = await p.query(
-      'SELECT * FROM inspection_tours WHERE client_id=$1 ORDER BY created_at DESC LIMIT 100',
+      'SELECT t.*, (SELECT COUNT(*) FROM inspections i WHERE i.tour_id = t.id) AS live_inspection_count ' +
+      'FROM inspection_tours t WHERE t.client_id=$1 ORDER BY t.created_at DESC LIMIT 100',
       [req.user.id]
     );
+    result.rows.forEach(function(r) { r.total_inspections = parseInt(r.live_inspection_count) || 0; });
     res.json(result.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -771,7 +786,18 @@ app.post('/api/client/users', authMiddleware, async function(req, res) {
   var b = req.body;
   if (!b.username || !b.password)
     return res.status(400).json({ error: 'Username and password required' });
+  var pwErr = checkPasswordStrength(b.password);
+  if (pwErr) return res.status(400).json({ error: pwErr });
   try {
+    var p0 = getPool();
+    var clientRow = await p0.query('SELECT plan, max_users FROM clients WHERE id=$1', [req.user.id]);
+    var plan = clientRow.rows.length ? clientRow.rows[0].plan : 'trial';
+    var maxUsers = clientRow.rows.length && clientRow.rows[0].max_users ? parseInt(clientRow.rows[0].max_users) : 3;
+    if (plan === 'trial') maxUsers = Math.min(maxUsers, 3);
+    var countRow = await p0.query('SELECT COUNT(*) AS cnt FROM client_users WHERE client_id=$1 AND active=TRUE', [req.user.id]);
+    if (parseInt(countRow.rows[0].cnt) >= maxUsers) {
+      return res.status(403).json({ error: 'User limit reached (' + maxUsers + ' users max' + (plan==='trial' ? ' on free trial' : '') + '). Contact us to upgrade.' });
+    }
     var hash = await bcrypt.hash(b.password, 10);
     var result = await getPool().query(
       'INSERT INTO client_users (client_id,username,password_hash,full_name,role,department) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
@@ -788,6 +814,10 @@ app.post('/api/client/users', authMiddleware, async function(req, res) {
 
 app.patch('/api/client/users/:id', authMiddleware, async function(req, res) {
   var b = req.body;
+  if (b.new_password) {
+    var pwE = checkPasswordStrength(b.new_password);
+    if (pwE) return res.status(400).json({ error: pwE });
+  }
   try {
     if (b.password) {
       var hash = await bcrypt.hash(b.password, 10);
@@ -830,6 +860,7 @@ app.patch('/api/owner/clients/:id', ownerMiddleware, async function(req, res) {
     }
     if (b.new_username) { updates.push('username=$'+i++); vals.push(b.new_username); }
     if (b.notes !== undefined) { updates.push('notes=$'+i++); vals.push(b.notes); }
+    if (parseInt(b.max_users) > 0) { updates.push('max_users=$'+i++); vals.push(parseInt(b.max_users)); }
     updates.push('updated_at=NOW()');
     vals.push(req.params.id);
     var result = await getPool().query(
