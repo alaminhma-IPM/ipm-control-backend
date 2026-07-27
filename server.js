@@ -76,6 +76,7 @@ async function ensureCompaniesSchema() {
     "ALTER TABLE devices DROP CONSTRAINT IF EXISTS devices_client_id_device_id_key",
     "CREATE UNIQUE INDEX IF NOT EXISTS devices_client_company_device_uniq ON devices (client_id, COALESCE(company_id, '00000000-0000-0000-0000-000000000000'::uuid), device_id)",
     "UPDATE corrective_actions ca SET company_id = i.company_id FROM inspections i WHERE ca.inspection_id = i.id AND i.company_id IS NOT NULL AND (ca.company_id IS NULL OR ca.company_id <> i.company_id)",
+    "UPDATE inspections i SET company_id = t.company_id FROM inspection_tours t WHERE i.tour_id = t.id AND t.company_id IS NOT NULL AND i.company_id IS NULL",
     "INSERT INTO companies (client_id, company_name, notes) SELECT id, company_name, 'Auto-created' FROM clients WHERE NOT EXISTS (SELECT 1 FROM companies co WHERE co.client_id = clients.id)",
     "UPDATE devices SET company_id = (SELECT co.id FROM companies co WHERE co.client_id = devices.client_id ORDER BY co.created_at FETCH FIRST ROW ONLY) WHERE company_id IS NULL",
     "UPDATE inspection_tours SET company_id = (SELECT co.id FROM companies co WHERE co.client_id = inspection_tours.client_id ORDER BY co.created_at FETCH FIRST ROW ONLY) WHERE company_id IS NULL",
@@ -1386,8 +1387,15 @@ app.post('/api/client/inspections', authMiddleware, async function(req, res) {
       if (dup.rows.length) return res.json(Object.assign({duplicate:true}, dup.rows[0]));
     }
     // Determine which company this inspection belongs to.
-    // Priority: (1) company account scope, (2) the tour's company, (3) device lookup.
+    // Priority: (1) company account scope, (2) explicit company_id (verified), (3) tour's company, (4) device lookup.
     var inspCompanyId = companyScope(req);
+    if (!inspCompanyId && b.company_id) {
+      // Trust an explicit company_id only if a device with this id exists in that company
+      try {
+        var verifyDev = await p.query('SELECT company_id FROM devices WHERE device_id=$1 AND client_id=$2 AND company_id=$3 LIMIT 1', [b.device_id, req.user.id, b.company_id]);
+        if (verifyDev.rows.length) inspCompanyId = b.company_id;
+      } catch(e) {}
+    }
     if (!inspCompanyId && b.tour_id) {
       try {
         var tourLookup = await p.query('SELECT company_id FROM inspection_tours WHERE id=$1 AND client_id=$2', [b.tour_id, req.user.id]);
@@ -1396,15 +1404,8 @@ app.post('/api/client/inspections', authMiddleware, async function(req, res) {
     }
     if (!inspCompanyId) {
       try {
-        // If a company_id was passed explicitly, prefer the device in that company
-        if (b.company_id) {
-          var devScoped = await p.query('SELECT company_id FROM devices WHERE device_id=$1 AND client_id=$2 AND company_id=$3 LIMIT 1', [b.device_id, req.user.id, b.company_id]);
-          if (devScoped.rows.length) inspCompanyId = devScoped.rows[0].company_id;
-        }
-        if (!inspCompanyId) {
-          var devLookup = await p.query('SELECT company_id FROM devices WHERE device_id=$1 AND client_id=$2 AND company_id IS NOT NULL LIMIT 1', [b.device_id, req.user.id]);
-          if (devLookup.rows.length) inspCompanyId = devLookup.rows[0].company_id;
-        }
+        var devLookup = await p.query('SELECT company_id FROM devices WHERE device_id=$1 AND client_id=$2 AND company_id IS NOT NULL LIMIT 1', [b.device_id, req.user.id]);
+        if (devLookup.rows.length) inspCompanyId = devLookup.rows[0].company_id;
       } catch(e) { inspCompanyId = null; }
     }
     var result = await p.query(
