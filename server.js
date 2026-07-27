@@ -1093,6 +1093,40 @@ app.delete('/api/client/companies/:id', authMiddleware, mainAccountOnly, async f
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// ── PEST CONTROL: read-only report for one of their production companies ──
+app.get('/api/client/companies/:id/report', authMiddleware, mainAccountOnly, async function(req, res) {
+  try {
+    var p = getPool();
+    var cid = req.user.id;
+    var companyId = req.params.id;
+    // Verify this company belongs to the requesting pest control account
+    var own = await p.query('SELECT id, company_name FROM companies WHERE id=$1 AND client_id=$2', [companyId, cid]);
+    if (!own.rows.length) return res.status(404).json({ error: 'Company not found' });
+
+    var insp = await p.query("SELECT status, COUNT(*) AS cnt FROM inspections WHERE client_id=$1 AND company_id=$2 AND created_at>NOW()-INTERVAL '30 days' GROUP BY status", [cid, companyId]);
+    var cas  = await p.query('SELECT ca.status, ca.severity, COUNT(*) AS cnt FROM corrective_actions ca LEFT JOIN devices d ON d.device_id=ca.device_id AND d.client_id=ca.client_id WHERE ca.client_id=$1 AND (ca.company_id=$2 OR d.company_id=$2) GROUP BY ca.status, ca.severity', [cid, companyId]);
+    var dev  = await p.query('SELECT COUNT(*) AS cnt FROM devices WHERE client_id=$1 AND company_id=$2 AND active=TRUE', [cid, companyId]);
+    var zones = await p.query("SELECT zone, COUNT(*) AS total, COUNT(*) FILTER(WHERE status='Good') AS good FROM inspections WHERE client_id=$1 AND company_id=$2 AND created_at>NOW()-INTERVAL '30 days' GROUP BY zone ORDER BY zone", [cid, companyId]);
+    var recentInsp = await p.query('SELECT device_id, device_type, zone, status, deficiency_type, inspector, created_at FROM inspections WHERE client_id=$1 AND company_id=$2 ORDER BY created_at DESC LIMIT 50', [cid, companyId]);
+    var openCas = await p.query('SELECT ca.device_id, ca.zone, ca.severity, ca.deficiency_type, ca.due_date, ca.status FROM corrective_actions ca LEFT JOIN devices d ON d.device_id=ca.device_id AND d.client_id=ca.client_id WHERE ca.client_id=$1 AND (ca.company_id=$2 OR d.company_id=$2) ORDER BY ca.created_at DESC LIMIT 100', [cid, companyId]);
+
+    var tot=0,good=0,ng=0,mon=0;
+    insp.rows.forEach(function(r){ var n=parseInt(r.cnt); tot+=n; if(r.status==='Good')good+=n; else if(r.status==='Not Good')ng+=n; else mon+=n; });
+
+    res.json({
+      company: own.rows[0],
+      inspections: { total:tot, good:good, not_good:ng, monitor:mon },
+      compliance_rate: tot ? Math.round(good/tot*100) : null,
+      cas: cas.rows,
+      devices: parseInt(dev.rows[0].cnt),
+      zones: zones.rows.map(function(z){ return { zone:z.zone, total:parseInt(z.total), good:parseInt(z.good) }; }),
+      recent_inspections: recentInsp.rows,
+      open_cas: openCas.rows.filter(function(x){ return x.status==='Open'; })
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── CLIENT: COMPANY <-> USER ASSIGNMENTS ──────────────
 app.get('/api/client/companies/:id/users', authMiddleware, mainAccountOnly, async function(req, res) {
   try {
