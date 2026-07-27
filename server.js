@@ -74,7 +74,10 @@ async function ensureCompaniesSchema() {
     "CREATE INDEX IF NOT EXISTS idx_tours_company ON inspection_tours(company_id)",
     "INSERT INTO companies (client_id, company_name, notes) SELECT id, company_name, 'Auto-created' FROM clients WHERE NOT EXISTS (SELECT 1 FROM companies co WHERE co.client_id = clients.id)",
     "UPDATE devices SET company_id = (SELECT co.id FROM companies co WHERE co.client_id = devices.client_id ORDER BY co.created_at FETCH FIRST ROW ONLY) WHERE company_id IS NULL",
-    "UPDATE inspection_tours SET company_id = (SELECT co.id FROM companies co WHERE co.client_id = inspection_tours.client_id ORDER BY co.created_at FETCH FIRST ROW ONLY) WHERE company_id IS NULL"
+    "UPDATE inspection_tours SET company_id = (SELECT co.id FROM companies co WHERE co.client_id = inspection_tours.client_id ORDER BY co.created_at FETCH FIRST ROW ONLY) WHERE company_id IS NULL",
+    "CREATE TABLE IF NOT EXISTS company_users (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE, client_id UUID NOT NULL REFERENCES clients(id) ON DELETE CASCADE, username VARCHAR(80) NOT NULL, password_hash TEXT NOT NULL, full_name VARCHAR(150), email VARCHAR(150), role VARCHAR(30) DEFAULT 'portal_viewer', active BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(client_id, username))",
+    "CREATE INDEX IF NOT EXISTS idx_company_users_company ON company_users(company_id)",
+    "CREATE INDEX IF NOT EXISTS idx_company_users_client ON company_users(client_id)"
   ];
   for (var i = 0; i < steps.length; i++) {
     try {
@@ -435,6 +438,52 @@ app.post('/api/auth/login', async function(req, res) {
       return res.json({ token: token, client: safe, expired: days <= 0 });
     }
 
+    // 2b. Check company_users table (production company portal — read-only)
+    try {
+      var cuTableCheck = await p.query("SELECT to_regclass('public.company_users') AS t");
+      if (cuTableCheck.rows[0].t) {
+        var portalResult = await p.query(
+          'SELECT pu.*, co.company_name AS production_company_name, co.id AS production_company_id, ' +
+          'c.company_name AS pest_control_company_name, c.plan, c.current_period_end, c.status AS client_status, c.logo_url ' +
+          'FROM company_users pu ' +
+          'JOIN companies co ON co.id = pu.company_id ' +
+          'JOIN clients c ON c.id = pu.client_id ' +
+          'WHERE pu.username=$1 AND pu.active=TRUE', [username]
+        );
+        if (portalResult.rows.length) {
+          var pu = portalResult.rows[0];
+          var validPortal = await bcrypt.compare(password, pu.password_hash);
+          if (validPortal) {
+            if (pu.client_status !== 'active') return res.status(403).json({ error: 'Account suspended' });
+            var daysLeftPortal = Math.ceil((new Date(pu.current_period_end) - new Date()) / 86400000);
+            var portalToken = jwt.sign(
+              { id: pu.client_id, username: pu.username, role: 'portal_viewer',
+                plan: pu.plan, expired: daysLeftPortal <= 0, user_type: 'portal_user',
+                portal_user_id: pu.id, company_id: pu.production_company_id,
+                full_name: pu.full_name },
+              secret, { expiresIn: '24h' }
+            );
+            return res.json({
+              token: portalToken,
+              client: {
+                id: pu.client_id,
+                username: pu.username,
+                company_name: pu.production_company_name,
+                pest_control_company_name: pu.pest_control_company_name,
+                plan: pu.plan,
+                current_period_end: pu.current_period_end,
+                user_type: 'portal_user',
+                company_id: pu.production_company_id,
+                full_name: pu.full_name,
+                logo_url: pu.logo_url
+              },
+              expired: daysLeftPortal <= 0
+            });
+          }
+        }
+      }
+    } catch(portalErr) { /* company_users table may not exist yet */ }
+
     // 2. Check client_users table (technicians added by clients)
     var userResult = await p.query(
       'SELECT cu.*, c.company_name, c.plan, c.current_period_end, c.status AS client_status, c.license_key, c.logo_url, c.country ' +
@@ -769,6 +818,166 @@ app.get('/api/owner/backup', ownerMiddleware, async function(req, res) {
   }
 });
 
+
+
+// ── PORTAL MIDDLEWARE (production company read-only users) ──
+function portalMiddleware(req, res, next) {
+  var auth = req.headers.authorization || '';
+  var token = auth.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    var decoded = jwt.verify(token, process.env.JWT_SECRET || 'IPMControl2026Secret');
+    if (decoded.user_type !== 'portal_user') return res.status(403).json({ error: 'Portal access only' });
+    req.user = decoded;
+    next();
+  } catch(e) { return res.status(401).json({ error: 'Invalid token' }); }
+}
+
+// ── PORTAL ROUTES (read-only, scoped to production company) ──
+
+// Portal: who am I?
+app.get('/api/portal/me', portalMiddleware, async function(req, res) {
+  try {
+    var co = await getPool().query(
+      'SELECT co.*, (SELECT COUNT(*) FROM devices d WHERE d.company_id=co.id) AS device_count FROM companies co WHERE co.id=$1',
+      [req.user.company_id]
+    );
+    if (!co.rows.length) return res.status(404).json({ error: 'Company not found' });
+    res.json(co.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Portal: dashboard stats
+app.get('/api/portal/dashboard', portalMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var cid = req.user.company_id;
+    var insp = await p.query(
+      'SELECT status, COUNT(*) AS cnt FROM inspections i ' +
+      'JOIN devices d ON d.device_id=i.device_id AND d.client_id=i.client_id ' +
+      'WHERE d.company_id=$1 AND i.created_at > NOW()-INTERVAL \'30 days\' GROUP BY status',
+      [cid]
+    );
+    var cas = await p.query(
+      'SELECT ca.status, ca.severity, COUNT(*) AS cnt FROM corrective_actions ca ' +
+      'JOIN devices d ON d.device_id=ca.device_id AND d.client_id=ca.client_id ' +
+      'WHERE d.company_id=$1 GROUP BY ca.status, ca.severity',
+      [cid]
+    );
+    var devices = await p.query('SELECT COUNT(*) AS cnt FROM devices WHERE company_id=$1 AND active=TRUE', [cid]);
+    var tours = await p.query(
+      'SELECT COUNT(*) FILTER (WHERE status=\'completed\') AS completed, COUNT(*) FILTER (WHERE status=\'in_progress\') AS in_progress FROM inspection_tours WHERE company_id=$1',
+      [cid]
+    );
+    var inspMap = { total:0, good:0, not_good:0, monitor:0 };
+    insp.rows.forEach(function(r){ inspMap.total+=parseInt(r.cnt); if(r.status==='Good')inspMap.good+=parseInt(r.cnt); else if(r.status==='Not Good')inspMap.not_good+=parseInt(r.cnt); else inspMap.monitor+=parseInt(r.cnt); });
+    var comp = inspMap.total ? Math.round(inspMap.good/inspMap.total*100) : null;
+    res.json({ inspections: inspMap, compliance_rate: comp, cas: cas.rows, devices: parseInt(devices.rows[0].cnt), tours: tours.rows[0] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Portal: devices list
+app.get('/api/portal/devices', portalMiddleware, async function(req, res) {
+  try {
+    var devs = await getPool().query(
+      'SELECT d.*, (SELECT i.status FROM inspections i WHERE i.device_id=d.device_id AND i.client_id=d.client_id ORDER BY i.created_at DESC LIMIT 1) AS last_status, ' +
+      '(SELECT COUNT(*) FROM corrective_actions ca WHERE ca.device_id=d.device_id AND ca.client_id=d.client_id AND ca.status=\'Open\') AS open_cas ' +
+      'FROM devices d WHERE d.company_id=$1 AND d.active=TRUE ORDER BY d.device_id',
+      [req.user.company_id]
+    );
+    res.json(devs.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Portal: inspections
+app.get('/api/portal/inspections', portalMiddleware, async function(req, res) {
+  try {
+    var limit = Math.min(parseInt(req.query.limit)||200, 500);
+    var result = await getPool().query(
+      'SELECT i.* FROM inspections i ' +
+      'JOIN devices d ON d.device_id=i.device_id AND d.client_id=i.client_id ' +
+      'WHERE d.company_id=$1 ORDER BY i.created_at DESC LIMIT $2',
+      [req.user.company_id, limit]
+    );
+    res.json(result.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Portal: corrective actions
+app.get('/api/portal/corrective-actions', portalMiddleware, async function(req, res) {
+  try {
+    var result = await getPool().query(
+      'SELECT ca.* FROM corrective_actions ca ' +
+      'JOIN devices d ON d.device_id=ca.device_id AND d.client_id=ca.client_id ' +
+      'WHERE d.company_id=$1 ORDER BY ca.created_at DESC',
+      [req.user.company_id]
+    );
+    res.json(result.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Portal: tour reports
+app.get('/api/portal/tours', portalMiddleware, async function(req, res) {
+  try {
+    var result = await getPool().query(
+      'SELECT t.*, (SELECT COUNT(*) FROM inspections i WHERE i.tour_id=t.id) AS total_inspections FROM inspection_tours t WHERE t.company_id=$1 ORDER BY t.created_at DESC LIMIT 50',
+      [req.user.company_id]
+    );
+    result.rows.forEach(function(r){ r.total_inspections=parseInt(r.total_inspections)||0; });
+    res.json(result.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Portal: single tour report with inspections
+app.get('/api/portal/tours/:id', portalMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var tour = await p.query('SELECT * FROM inspection_tours WHERE id=$1 AND company_id=$2', [req.params.id, req.user.company_id]);
+    if (!tour.rows.length) return res.status(404).json({ error: 'Tour not found' });
+    var insps = await p.query('SELECT * FROM inspections WHERE tour_id=$1 ORDER BY created_at', [req.params.id]);
+    res.json({ tour: tour.rows[0], inspections: insps.rows });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── PEST CONTROL ADMIN: Manage portal users for their companies ──
+app.get('/api/client/companies/:id/portal-users', authMiddleware, mainAccountOnly, async function(req, res) {
+  try {
+    var tableCheck = await getPool().query("SELECT to_regclass('public.company_users') AS t");
+    if (!tableCheck.rows[0].t) return res.json([]);
+    var result = await getPool().query(
+      'SELECT id, username, full_name, email, role, active, created_at FROM company_users WHERE company_id=$1 AND client_id=$2 ORDER BY created_at DESC',
+      [req.params.id, req.user.id]
+    );
+    res.json(result.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/client/companies/:id/portal-users', authMiddleware, mainAccountOnly, async function(req, res) {
+  var b = req.body;
+  if (!b.username || !b.password) return res.status(400).json({ error: 'Username and password are required' });
+  var pwErr = checkPasswordStrength(b.password);
+  if (pwErr) return res.status(400).json({ error: pwErr });
+  try {
+    var tableCheck = await getPool().query("SELECT to_regclass('public.company_users') AS t");
+    if (!tableCheck.rows[0].t) return res.status(503).json({ error: 'Portal feature not yet initialized — please wait a moment and retry' });
+    var hash = await bcrypt.hash(b.password, 10);
+    var result = await getPool().query(
+      'INSERT INTO company_users (company_id, client_id, username, password_hash, full_name, email) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, username, full_name, email, role, active, created_at',
+      [req.params.id, req.user.id, b.username, hash, b.full_name||'', b.email||'']
+    );
+    res.json(result.rows[0]);
+  } catch(e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Username already exists' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete('/api/client/companies/:id/portal-users/:uid', authMiddleware, mainAccountOnly, async function(req, res) {
+  try {
+    await getPool().query('DELETE FROM company_users WHERE id=$1 AND company_id=$2 AND client_id=$3', [req.params.uid, req.params.id, req.user.id]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── CLIENT: COMPANIES (customer sites) ────────────────
 app.get('/api/client/companies', authMiddleware, async function(req, res) {
