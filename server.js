@@ -75,6 +75,7 @@ async function ensureCompaniesSchema() {
     "DROP INDEX IF EXISTS devices_client_id_device_id_key",
     "ALTER TABLE devices DROP CONSTRAINT IF EXISTS devices_client_id_device_id_key",
     "CREATE UNIQUE INDEX IF NOT EXISTS devices_client_company_device_uniq ON devices (client_id, COALESCE(company_id, '00000000-0000-0000-0000-000000000000'::uuid), device_id)",
+    "UPDATE corrective_actions ca SET company_id = i.company_id FROM inspections i WHERE ca.inspection_id = i.id AND i.company_id IS NOT NULL AND (ca.company_id IS NULL OR ca.company_id <> i.company_id)",
     "INSERT INTO companies (client_id, company_name, notes) SELECT id, company_name, 'Auto-created' FROM clients WHERE NOT EXISTS (SELECT 1 FROM companies co WHERE co.client_id = clients.id)",
     "UPDATE devices SET company_id = (SELECT co.id FROM companies co WHERE co.client_id = devices.client_id ORDER BY co.created_at FETCH FIRST ROW ONLY) WHERE company_id IS NULL",
     "UPDATE inspection_tours SET company_id = (SELECT co.id FROM companies co WHERE co.client_id = inspection_tours.client_id ORDER BY co.created_at FETCH FIRST ROW ONLY) WHERE company_id IS NULL",
@@ -1135,11 +1136,11 @@ app.get('/api/client/companies/:id/report', authMiddleware, mainAccountOnly, asy
     if (!own.rows.length) return res.status(404).json({ error: 'Company not found' });
 
     var insp = await p.query("SELECT status, COUNT(*) AS cnt FROM inspections WHERE client_id=$1 AND company_id=$2 AND created_at>NOW()-INTERVAL '30 days' GROUP BY status", [cid, companyId]);
-    var cas  = await p.query('SELECT ca.status, ca.severity, COUNT(*) AS cnt FROM corrective_actions ca LEFT JOIN devices d ON d.device_id=ca.device_id AND d.client_id=ca.client_id WHERE ca.client_id=$1 AND (ca.company_id=$2 OR d.company_id=$2) GROUP BY ca.status, ca.severity', [cid, companyId]);
+    var cas  = await p.query('SELECT ca.status, ca.severity, COUNT(*) AS cnt FROM corrective_actions ca WHERE ca.client_id=$1 AND ca.company_id=$2 GROUP BY ca.status, ca.severity', [cid, companyId]);
     var dev  = await p.query('SELECT COUNT(*) AS cnt FROM devices WHERE client_id=$1 AND company_id=$2 AND active=TRUE', [cid, companyId]);
     var zones = await p.query("SELECT zone, COUNT(*) AS total, COUNT(*) FILTER(WHERE status='Good') AS good FROM inspections WHERE client_id=$1 AND company_id=$2 AND created_at>NOW()-INTERVAL '30 days' GROUP BY zone ORDER BY zone", [cid, companyId]);
     var recentInsp = await p.query('SELECT device_id, device_type, zone, status, deficiency_type, inspector, created_at FROM inspections WHERE client_id=$1 AND company_id=$2 ORDER BY created_at DESC LIMIT 50', [cid, companyId]);
-    var openCas = await p.query('SELECT ca.device_id, ca.zone, ca.severity, ca.deficiency_type, ca.due_date, ca.status FROM corrective_actions ca LEFT JOIN devices d ON d.device_id=ca.device_id AND d.client_id=ca.client_id WHERE ca.client_id=$1 AND (ca.company_id=$2 OR d.company_id=$2) ORDER BY ca.created_at DESC LIMIT 100', [cid, companyId]);
+    var openCas = await p.query('SELECT ca.device_id, ca.zone, ca.severity, ca.deficiency_type, ca.due_date, ca.status FROM corrective_actions ca WHERE ca.client_id=$1 AND ca.company_id=$2 ORDER BY ca.created_at DESC LIMIT 100', [cid, companyId]);
 
     var tot=0,good=0,ng=0,mon=0;
     insp.rows.forEach(function(r){ var n=parseInt(r.cnt); tot+=n; if(r.status==='Good')good+=n; else if(r.status==='Not Good')ng+=n; else mon+=n; });
@@ -1406,10 +1407,19 @@ app.post('/api/client/inspections', authMiddleware, async function(req, res) {
     if (b.status === 'Not Good' && b.deficiency_type) {
       var rule = DEFICIENCY_RULES[b.deficiency_type] || DEFAULT_RULE;
       var due  = new Date(Date.now() + rule.h * 3600000);
-      var caResult = await getPool().query(
-        'INSERT INTO corrective_actions (client_id,inspection_id,device_id,zone,severity,deficiency_type,department,due_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-        [req.user.id, insp.id, b.device_id, b.zone||'', rule.sev, b.deficiency_type, rule.dept, due]
-      );
+      var caResult;
+      try {
+        caResult = await getPool().query(
+          'INSERT INTO corrective_actions (client_id,inspection_id,device_id,zone,severity,deficiency_type,department,due_date,company_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
+          [req.user.id, insp.id, b.device_id, b.zone||'', rule.sev, b.deficiency_type, rule.dept, due, inspCompanyId || null]
+        );
+      } catch(caColErr) {
+        // Fallback if company_id column doesn't exist yet
+        caResult = await getPool().query(
+          'INSERT INTO corrective_actions (client_id,inspection_id,device_id,zone,severity,deficiency_type,department,due_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
+          [req.user.id, insp.id, b.device_id, b.zone||'', rule.sev, b.deficiency_type, rule.dept, due]
+        );
+      }
       ca = caResult.rows[0];
     }
     res.json({ inspection: insp, corrective_action: ca });
@@ -1425,11 +1435,12 @@ app.get('/api/client/corrective-actions', authMiddleware, async function(req, re
     var result;
     var coScopeCA = companyScope(req);
     if (coScopeCA) {
-      // Production company account: only their own facility's corrective actions
+      // Production company account: only their own facility's corrective actions.
+      // Match strictly by the CA's own company_id, or (for legacy CAs with no company_id)
+      // by a device that belongs to this company AND shares the same tour/inspection lineage.
       result = await p.query(
         'SELECT ca.* FROM corrective_actions ca ' +
-        'LEFT JOIN devices d ON d.device_id = ca.device_id AND d.client_id = ca.client_id ' +
-        'WHERE ca.client_id=$1 AND (ca.company_id=$2 OR d.company_id=$2) ORDER BY ca.created_at DESC',
+        'WHERE ca.client_id=$1 AND ca.company_id=$2 ORDER BY ca.created_at DESC',
         [req.user.id, coScopeCA]
       );
     } else if (req.user.user_type === 'sub_user') {
@@ -1478,7 +1489,7 @@ app.get('/api/client/dashboard', authMiddleware, async function(req, res) {
       // Production company account: scope everything to their facility
       var p2 = getPool();
       var dInsp = await p2.query("SELECT status, COUNT(*) AS cnt FROM inspections WHERE client_id=$1 AND company_id=$2 AND created_at>NOW()-INTERVAL '30 days' GROUP BY status", [cid, coDash]);
-      var dCas  = await p2.query('SELECT ca.status, ca.severity, COUNT(*) AS cnt FROM corrective_actions ca LEFT JOIN devices d ON d.device_id=ca.device_id AND d.client_id=ca.client_id WHERE ca.client_id=$1 AND (ca.company_id=$2 OR d.company_id=$2) GROUP BY ca.status, ca.severity', [cid, coDash]);
+      var dCas  = await p2.query('SELECT ca.status, ca.severity, COUNT(*) AS cnt FROM corrective_actions ca WHERE ca.client_id=$1 AND ca.company_id=$2 GROUP BY ca.status, ca.severity', [cid, coDash]);
       var dDev  = await p2.query('SELECT COUNT(*) AS cnt FROM devices WHERE client_id=$1 AND company_id=$2 AND active=TRUE', [cid, coDash]);
       var dZone = await p2.query("SELECT zone, COUNT(*) AS total, COUNT(*) FILTER(WHERE status='Good') AS good FROM inspections WHERE client_id=$1 AND company_id=$2 AND created_at>NOW()-INTERVAL '30 days' GROUP BY zone ORDER BY zone", [cid, coDash]);
       var dTot=0,dGood=0,dNg=0,dMon=0;
