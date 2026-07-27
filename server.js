@@ -77,6 +77,9 @@ async function ensureCompaniesSchema() {
     "CREATE UNIQUE INDEX IF NOT EXISTS devices_client_company_device_uniq ON devices (client_id, COALESCE(company_id, '00000000-0000-0000-0000-000000000000'::uuid), device_id)",
     "UPDATE corrective_actions ca SET company_id = i.company_id FROM inspections i WHERE ca.inspection_id = i.id AND i.company_id IS NOT NULL AND (ca.company_id IS NULL OR ca.company_id <> i.company_id)",
     "UPDATE inspections i SET company_id = t.company_id FROM inspection_tours t WHERE i.tour_id = t.id AND t.company_id IS NOT NULL AND i.company_id IS NULL",
+    "UPDATE corrective_actions ca SET company_id = i.company_id FROM inspections i WHERE ca.inspection_id = i.id AND i.company_id IS NOT NULL AND (ca.company_id IS NULL OR ca.company_id <> i.company_id)",
+    "UPDATE inspections i SET company_id = (SELECT uc.company_id FROM user_companies uc WHERE uc.sub_user_id = i.sub_user_id FETCH FIRST ROW ONLY) WHERE i.company_id IS NULL AND i.sub_user_id IS NOT NULL AND (SELECT COUNT(*) FROM user_companies uc2 WHERE uc2.sub_user_id = i.sub_user_id) = 1",
+    "UPDATE corrective_actions ca SET company_id = i.company_id FROM inspections i WHERE ca.inspection_id = i.id AND i.company_id IS NOT NULL AND ca.company_id IS NULL",
     "INSERT INTO companies (client_id, company_name, notes) SELECT id, company_name, 'Auto-created' FROM clients WHERE NOT EXISTS (SELECT 1 FROM companies co WHERE co.client_id = clients.id)",
     "UPDATE devices SET company_id = (SELECT co.id FROM companies co WHERE co.client_id = devices.client_id ORDER BY co.created_at FETCH FIRST ROW ONLY) WHERE company_id IS NULL",
     "UPDATE inspection_tours SET company_id = (SELECT co.id FROM companies co WHERE co.client_id = inspection_tours.client_id ORDER BY co.created_at FETCH FIRST ROW ONLY) WHERE company_id IS NULL",
@@ -556,8 +559,9 @@ app.post('/api/auth/login', async function(req, res) {
 app.get('/api/client/me', authMiddleware, async function(req, res) {
   try {
     var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
-    // Production company account: return their company context, not the pest control company
-    if (req.user.user_type === 'company_account') {
+    // Production company account: detect by token type OR by presence of portal_user_id
+    // (older tokens may say 'portal_user' — treat them the same as 'company_account')
+    if (req.user.user_type === 'company_account' || req.user.user_type === 'portal_user' || req.user.portal_user_id) {
       var coRes = await p.query(
         'SELECT co.company_name AS production_company_name, co.id AS company_id, ' +
         'c.plan, c.current_period_end, c.status AS client_status, c.logo_url, ' +
