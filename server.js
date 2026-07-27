@@ -1619,15 +1619,31 @@ app.post('/api/client/change-password', authMiddleware, async function(req, res)
 // ── CLIENT: USERS ─────────────────────────────────────
 app.get('/api/client/users', authMiddleware, async function(req, res) {
   try {
-    var result = await getPool().query(
-      'SELECT * FROM client_users WHERE client_id=$1 ORDER BY created_at DESC',
-      [req.user.id]
-    );
+    var coUsers = companyScope(req);
+    var result;
+    if (coUsers) {
+      // Production company: only technicians assigned to their own company
+      try {
+        result = await getPool().query(
+          'SELECT DISTINCT cu.* FROM client_users cu ' +
+          'JOIN user_companies uc ON uc.sub_user_id = cu.id ' +
+          'WHERE cu.client_id=$1 AND uc.company_id=$2 ORDER BY cu.created_at DESC',
+          [req.user.id, coUsers]
+        );
+      } catch(joinErr) {
+        result = await getPool().query('SELECT * FROM client_users WHERE client_id=$1 ORDER BY created_at DESC', [req.user.id]);
+      }
+    } else {
+      result = await getPool().query(
+        'SELECT * FROM client_users WHERE client_id=$1 ORDER BY created_at DESC',
+        [req.user.id]
+      );
+    }
     res.json(result.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/client/users', authMiddleware, mainAccountOnly, pestControlOnly, async function(req, res) {
+app.post('/api/client/users', authMiddleware, mainAccountOnly, async function(req, res) {
   var b = req.body;
   if (!b.username || !b.password)
     return res.status(400).json({ error: 'Username and password required' });
@@ -1648,7 +1664,18 @@ app.post('/api/client/users', authMiddleware, mainAccountOnly, pestControlOnly, 
       'INSERT INTO client_users (client_id,username,password_hash,full_name,role,department) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
       [req.user.id, b.username, hash, b.full_name||'', b.role||'inspector', b.department||'']
     );
-    var safe = Object.assign({}, result.rows[0]);
+    var newUser = result.rows[0];
+    // If a production company created this technician, auto-assign them to that company
+    var creatorCompanyId = companyScope(req);
+    if (creatorCompanyId) {
+      try {
+        await getPool().query(
+          'INSERT INTO user_companies (sub_user_id, company_id) VALUES ($1,$2) ON CONFLICT (sub_user_id, company_id) DO NOTHING',
+          [newUser.id, creatorCompanyId]
+        );
+      } catch(assignErr) { /* table may not exist yet; non-fatal */ }
+    }
+    var safe = Object.assign({}, newUser);
     delete safe.password_hash;
     res.json(safe);
   } catch(e) {
@@ -1657,7 +1684,7 @@ app.post('/api/client/users', authMiddleware, mainAccountOnly, pestControlOnly, 
   }
 });
 
-app.patch('/api/client/users/:id', authMiddleware, mainAccountOnly, pestControlOnly, async function(req, res) {
+app.patch('/api/client/users/:id', authMiddleware, mainAccountOnly, async function(req, res) {
   var b = req.body;
   if (b.new_password) {
     var pwE = checkPasswordStrength(b.new_password);
@@ -1681,7 +1708,7 @@ app.patch('/api/client/users/:id', authMiddleware, mainAccountOnly, pestControlO
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/client/users/:id', authMiddleware, mainAccountOnly, pestControlOnly, async function(req, res) {
+app.delete('/api/client/users/:id', authMiddleware, mainAccountOnly, async function(req, res) {
   try {
     await getPool().query('DELETE FROM client_users WHERE id=$1 AND client_id=$2', [req.params.id, req.user.id]);
     res.json({ ok: true });
