@@ -72,6 +72,9 @@ async function ensureCompaniesSchema() {
     "ALTER TABLE inspection_tours ADD COLUMN IF NOT EXISTS company_id UUID REFERENCES companies(id) ON DELETE SET NULL",
     "CREATE INDEX IF NOT EXISTS idx_devices_company ON devices(company_id)",
     "CREATE INDEX IF NOT EXISTS idx_tours_company ON inspection_tours(company_id)",
+    "DROP INDEX IF EXISTS devices_client_id_device_id_key",
+    "ALTER TABLE devices DROP CONSTRAINT IF EXISTS devices_client_id_device_id_key",
+    "CREATE UNIQUE INDEX IF NOT EXISTS devices_client_company_device_uniq ON devices (client_id, COALESCE(company_id, '00000000-0000-0000-0000-000000000000'::uuid), device_id)",
     "INSERT INTO companies (client_id, company_name, notes) SELECT id, company_name, 'Auto-created' FROM clients WHERE NOT EXISTS (SELECT 1 FROM companies co WHERE co.client_id = clients.id)",
     "UPDATE devices SET company_id = (SELECT co.id FROM companies co WHERE co.client_id = devices.client_id ORDER BY co.created_at FETCH FIRST ROW ONLY) WHERE company_id IS NULL",
     "UPDATE inspection_tours SET company_id = (SELECT co.id FROM companies co WHERE co.client_id = inspection_tours.client_id ORDER BY co.created_at FETCH FIRST ROW ONLY) WHERE company_id IS NULL",
@@ -1200,10 +1203,27 @@ app.post('/api/client/devices', authMiddleware, mainAccountOnly, async function(
   if (!b.device_id || !b.device_type) return res.status(400).json({ error: 'device_id and device_type required' });
   try {
     var p = getPool();
-    var result = await p.query(
-      'INSERT INTO devices (client_id,device_id,device_type,zone,location) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (client_id,device_id) DO NOTHING RETURNING *',
-      [req.user.id, b.device_id, b.device_type, b.zone||'', b.location||b.zone||'']
-    );
+    var singleCompanyId = b.company_id || companyScope(req) || null;
+    // Check for existing device within the same company
+    var dupCheck;
+    if (singleCompanyId) {
+      dupCheck = await p.query('SELECT id FROM devices WHERE client_id=$1 AND device_id=$2 AND company_id=$3 LIMIT 1', [req.user.id, b.device_id, singleCompanyId]);
+    } else {
+      dupCheck = await p.query('SELECT id FROM devices WHERE client_id=$1 AND device_id=$2 AND company_id IS NULL LIMIT 1', [req.user.id, b.device_id]);
+    }
+    if (dupCheck.rows.length) return res.json({ skipped: true, device_id: b.device_id, reason: 'already exists in this company' });
+    var result;
+    try {
+      result = await p.query(
+        'INSERT INTO devices (client_id,device_id,device_type,zone,location,company_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+        [req.user.id, b.device_id, b.device_type, b.zone||'', b.location||b.zone||'', singleCompanyId]
+      );
+    } catch(colErrS) {
+      result = await p.query(
+        'INSERT INTO devices (client_id,device_id,device_type,zone,location) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+        [req.user.id, b.device_id, b.device_type, b.zone||'', b.location||b.zone||'']
+      );
+    }
     res.json(result.rows[0] || { skipped: true, device_id: b.device_id });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1258,19 +1278,37 @@ app.post('/api/client/devices/bulk', authMiddleware, mainAccountOnly, async func
       var d = items[j];
       try {
         var r;
+        var devCompanyId = d.company_id || companyScope(req) || null;
+        // Check for an existing device with the same ID *within the same company*
+        var existsCheck;
+        if (devCompanyId) {
+          existsCheck = await client.query(
+            'SELECT id FROM devices WHERE client_id=$1 AND device_id=$2 AND company_id=$3 LIMIT 1',
+            [req.user.id, d.device_id, devCompanyId]
+          );
+        } else {
+          existsCheck = await client.query(
+            'SELECT id FROM devices WHERE client_id=$1 AND device_id=$2 AND company_id IS NULL LIMIT 1',
+            [req.user.id, d.device_id]
+          );
+        }
+        if (existsCheck.rows.length > 0) {
+          skipped++;
+          results.push({ device_id: d.device_id, status: 'skipped', reason: 'already exists in this company' });
+          continue;
+        }
+        // Insert — device is unique within its company
         try {
           r = await client.query(
             'INSERT INTO devices (client_id, device_id, device_type, zone, location, company_id) ' +
-            'VALUES ($1, $2, $3, $4, $5, $6) ' +
-            'ON CONFLICT (client_id, device_id) DO NOTHING RETURNING device_id',
-            [req.user.id, d.device_id, d.device_type, d.zone||d.location||'', d.location||d.zone||'', d.company_id||null]
+            'VALUES ($1, $2, $3, $4, $5, $6) RETURNING device_id',
+            [req.user.id, d.device_id, d.device_type, d.zone||d.location||'', d.location||d.zone||'', devCompanyId]
           );
         } catch(colErr2) {
           // Fallback if company_id column doesn't exist yet
           r = await client.query(
             'INSERT INTO devices (client_id, device_id, device_type, zone, location) ' +
-            'VALUES ($1, $2, $3, $4, $5) ' +
-            'ON CONFLICT (client_id, device_id) DO NOTHING RETURNING device_id',
+            'VALUES ($1, $2, $3, $4, $5) RETURNING device_id',
             [req.user.id, d.device_id, d.device_type, d.zone||d.location||'', d.location||d.zone||'']
           );
         }
