@@ -488,7 +488,8 @@ app.post('/api/auth/login', async function(req, res) {
                 pest_control_company_name: pu.pest_control_company_name,
                 plan: pu.plan,
                 current_period_end: pu.current_period_end,
-                user_type: 'portal_user',
+                user_type: 'company_account',
+                is_company_account: true,
                 company_id: pu.production_company_id,
                 full_name: pu.full_name,
                 logo_url: pu.logo_url
