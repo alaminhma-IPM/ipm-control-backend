@@ -459,6 +459,8 @@ app.post('/api/auth/login', async function(req, res) {
       );
       var safe = Object.assign({}, client);
       delete safe.password_hash;
+      safe.user_type = 'client_main';
+      safe.company_id = null; // pest control admin is not scoped to a single production company
       return res.json({ token: token, client: safe, expired: days <= 0 });
     }
 
@@ -589,6 +591,10 @@ app.get('/api/client/me', authMiddleware, async function(req, res) {
     if (req.user.user_type === 'sub_user') {
       safe.user_type = 'sub_user'; safe.sub_user_id = req.user.sub_user_id;
       safe.full_name = req.user.full_name || safe.full_name; safe.role = req.user.role || safe.role;
+    } else {
+      // Pest control main account — mark it explicitly so the frontend detects it correctly
+      safe.user_type = 'client_main';
+      safe.company_id = null; // pest control is not scoped to any single production company
     }
     var days = Math.ceil((new Date(safe.current_period_end) - new Date()) / 86400000);
     res.json(Object.assign(safe, { days_left: days, expired: days <= 0 }));
