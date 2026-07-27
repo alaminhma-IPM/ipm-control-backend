@@ -85,7 +85,9 @@ async function ensureCompaniesSchema() {
     "UPDATE inspection_tours SET company_id = (SELECT co.id FROM companies co WHERE co.client_id = inspection_tours.client_id ORDER BY co.created_at FETCH FIRST ROW ONLY) WHERE company_id IS NULL",
     "CREATE TABLE IF NOT EXISTS company_users (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE, client_id UUID NOT NULL REFERENCES clients(id) ON DELETE CASCADE, username VARCHAR(80) NOT NULL, password_hash TEXT NOT NULL, full_name VARCHAR(150), email VARCHAR(150), role VARCHAR(30) DEFAULT 'portal_viewer', active BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(client_id, username))",
     "CREATE INDEX IF NOT EXISTS idx_company_users_company ON company_users(company_id)",
-    "CREATE INDEX IF NOT EXISTS idx_company_users_client ON company_users(client_id)"
+    "CREATE INDEX IF NOT EXISTS idx_company_users_client ON company_users(client_id)",
+    "ALTER TABLE client_documents ADD COLUMN IF NOT EXISTS company_id UUID REFERENCES companies(id) ON DELETE SET NULL",
+    "CREATE INDEX IF NOT EXISTS idx_docs_company ON client_documents(company_id)"
   ];
   for (var i = 0; i < steps.length; i++) {
     try {
@@ -189,9 +191,19 @@ function mainAccountOnly(req, res, next) {
 
 // ── COMPANY SCOPING ───────────────────────────────────
 // Production Company accounts are hard-scoped to their own company_id.
-// Returns the company_id to filter by, or null for pest-control accounts.
+// Pest control admins (client_main) may additionally act on behalf of one of
+// their own production companies by sending X-Acting-Company-Id — used when
+// they "enter" a company's workspace from the Companies list. This is safe:
+// every query that calls companyScope() also filters by client_id=req.user.id,
+// so an id for a company outside their tenant simply matches zero rows.
+// Returns the company_id to filter by, or null for the pest-control-wide view.
 function companyScope(req) {
-  return (req.user && req.user.user_type === 'company_account') ? req.user.company_id : null;
+  if (req.user && req.user.user_type === 'company_account') return req.user.company_id;
+  if (req.user && req.user.user_type === 'client_main') {
+    var acting = req.headers && req.headers['x-acting-company-id'];
+    if (acting) return acting;
+  }
+  return null;
 }
 
 // Blocks production-company accounts from pest-control-only features
@@ -1862,10 +1874,21 @@ app.get('/api/owner/stats', ownerMiddleware, async function(req, res) {
 app.get('/api/client/documents', authMiddleware, async function(req, res) {
   try {
     var p = getPool();
-    var result = await p.query(
-      'SELECT * FROM client_documents WHERE client_id=$1 ORDER BY created_at DESC',
-      [req.user.id]
-    );
+    var coDocs = companyScope(req);
+    var result;
+    if (coDocs) {
+      // Scoped to one production company: show that company's docs plus any
+      // shared/company-wide docs (company_id IS NULL) uploaded by pest control.
+      result = await p.query(
+        'SELECT * FROM client_documents WHERE client_id=$1 AND (company_id=$2 OR company_id IS NULL) ORDER BY created_at DESC',
+        [req.user.id, coDocs]
+      );
+    } else {
+      result = await p.query(
+        'SELECT * FROM client_documents WHERE client_id=$1 ORDER BY created_at DESC',
+        [req.user.id]
+      );
+    }
     res.json(result.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1878,9 +1901,10 @@ app.post('/api/client/documents', authMiddleware, mainAccountOnly, async functio
     return res.status(400).json({ error: 'doc_type must be msds, layout, or other' });
   try {
     var p = getPool();
+    var docCompanyId = b.company_id || companyScope(req) || null;
     var result = await p.query(
-      'INSERT INTO client_documents (client_id, name, doc_type, file_data, file_type, uploaded_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,name,doc_type,file_type,uploaded_by,created_at',
-      [req.user.id, b.name, b.doc_type, b.file_data, b.file_type||'application/pdf', b.uploaded_by||req.user.username]
+      'INSERT INTO client_documents (client_id, name, doc_type, file_data, file_type, uploaded_by, company_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,name,doc_type,file_type,uploaded_by,created_at,company_id',
+      [req.user.id, b.name, b.doc_type, b.file_data, b.file_type||'application/pdf', b.uploaded_by||req.user.username, docCompanyId]
     );
     res.json(result.rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
