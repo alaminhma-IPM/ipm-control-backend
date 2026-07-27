@@ -178,6 +178,22 @@ function mainAccountOnly(req, res, next) {
   next();
 }
 
+
+// ── COMPANY SCOPING ───────────────────────────────────
+// Production Company accounts are hard-scoped to their own company_id.
+// Returns the company_id to filter by, or null for pest-control accounts.
+function companyScope(req) {
+  return (req.user && req.user.user_type === 'company_account') ? req.user.company_id : null;
+}
+
+// Blocks production-company accounts from pest-control-only features
+function pestControlOnly(req, res, next) {
+  if (req.user && req.user.user_type === 'company_account') {
+    return res.status(403).json({ error: 'Not available for production company accounts' });
+  }
+  next();
+}
+
 function authMiddleware(req, res, next) {
   var header = req.headers.authorization || '';
   var token = header.split(' ')[1];
@@ -457,8 +473,8 @@ app.post('/api/auth/login', async function(req, res) {
             if (pu.client_status !== 'active') return res.status(403).json({ error: 'Account suspended' });
             var daysLeftPortal = Math.ceil((new Date(pu.current_period_end) - new Date()) / 86400000);
             var portalToken = jwt.sign(
-              { id: pu.client_id, username: pu.username, role: 'portal_viewer',
-                plan: pu.plan, expired: daysLeftPortal <= 0, user_type: 'portal_user',
+              { id: pu.client_id, username: pu.username, role: 'company_admin',
+                plan: pu.plan, expired: daysLeftPortal <= 0, user_type: 'company_account',
                 portal_user_id: pu.id, company_id: pu.production_company_id,
                 full_name: pu.full_name },
               secret, { expiresIn: '24h' }
@@ -550,6 +566,14 @@ app.get('/api/client/devices', authMiddleware, async function(req, res) {
   try {
     var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
     var result;
+    var coDev = companyScope(req);
+    if (coDev) {
+      result = await p.query(
+        'SELECT * FROM devices WHERE client_id=$1 AND company_id=$2 AND active=TRUE ORDER BY device_id',
+        [req.user.id, coDev]
+      );
+      return res.json(result.rows);
+    }
     if (req.user.user_type === 'sub_user') {
       // Technicians only see devices belonging to companies they're assigned to
       try {
@@ -617,6 +641,16 @@ app.get('/api/client/tours', authMiddleware, async function(req, res) {
   try {
     var p = getPool();
     var result;
+    var coTours = companyScope(req);
+    if (coTours) {
+      result = await p.query(
+        'SELECT t.*, (SELECT COUNT(*) FROM inspections i WHERE i.tour_id = t.id) AS live_inspection_count ' +
+        'FROM inspection_tours t WHERE t.client_id=$1 AND t.company_id=$2 ORDER BY t.created_at DESC LIMIT 100',
+        [req.user.id, coTours]
+      );
+      result.rows.forEach(function(r) { r.total_inspections = parseInt(r.live_inspection_count) || 0; });
+      return res.json(result.rows);
+    }
     if (req.user.user_type === 'sub_user') {
       // Technicians see tours they started, contributed to, OR that belong to a company they're assigned to
       try {
@@ -692,6 +726,9 @@ app.post('/api/client/tours', authMiddleware, async function(req, res) {
   var b = req.body;
   try {
     var p = getPool();
+    // Company accounts always create tours for their own facility
+    var coTourPost = companyScope(req);
+    if (coTourPost) b.company_id = coTourPost;
     // If company_id provided, verify it exists; if not (old clients), allow tour without company
     if (b.company_id) {
       var tableCheck2 = await p.query("SELECT to_regclass('public.companies') AS t");
@@ -745,7 +782,13 @@ app.patch('/api/client/tours/:id/complete', authMiddleware, async function(req, 
 app.get('/api/client/chemicals', authMiddleware, async function(req, res) {
   try {
     var result;
-    if (req.user.user_type === 'sub_user') {
+    var coScopeChem = companyScope(req);
+    if (coScopeChem) {
+      result = await getPool().query(
+        'SELECT * FROM chemical_applications WHERE client_id=$1 AND company_id=$2 ORDER BY created_at DESC LIMIT 200',
+        [req.user.id, coScopeChem]
+      );
+    } else if (req.user.user_type === 'sub_user') {
       var myName = req.user.full_name ? req.user.full_name + ' (' + req.user.username + ')' : req.user.username;
       result = await getPool().query(
         'SELECT * FROM chemical_applications WHERE client_id=$1 AND applied_by=$2 ORDER BY created_at DESC LIMIT 200',
@@ -766,13 +809,13 @@ app.post('/api/client/chemicals', authMiddleware, async function(req, res) {
   if (!b.product) return res.status(400).json({ error: 'Product name is required' });
   try {
     var result = await getPool().query(
-      'INSERT INTO chemical_applications (client_id,tour_id,product,registration_no,batch_no,quantity,concentration,application_method,target_pest,treatment_area,ppe_used,weather,notes,applied_by,photo_url) ' +
-      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *',
+      'INSERT INTO chemical_applications (client_id,tour_id,product,registration_no,batch_no,quantity,concentration,application_method,target_pest,treatment_area,ppe_used,weather,notes,applied_by,photo_url,company_id) ' +
+      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *',
       [req.user.id, b.tour_id||null, b.product, b.registration_no||'', b.batch_no||'',
        b.quantity||'', b.concentration||'', b.application_method||'', b.target_pest||'',
        b.treatment_area||'', b.ppe_used||'', b.weather||'', b.notes||'',
        b.applied_by || (req.user.full_name ? req.user.full_name + ' (' + req.user.username + ')' : req.user.username),
-       b.photo_url || null]
+       b.photo_url || null, companyScope(req) || b.company_id || null]
     );
     res.json(result.rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -981,6 +1024,7 @@ app.delete('/api/client/companies/:id/portal-users/:uid', authMiddleware, mainAc
 
 // ── CLIENT: COMPANIES (customer sites) ────────────────
 app.get('/api/client/companies', authMiddleware, async function(req, res) {
+  if (companyScope(req)) return res.json([]); // production companies don't manage other companies
   try {
     var p = getPool();
     // If the companies table doesn't exist yet, return an empty list instead of erroring
@@ -1119,6 +1163,11 @@ app.post('/api/client/devices/bulk', authMiddleware, mainAccountOnly, async func
   var p = getPool();
   if (!p) return res.status(500).json({ error: 'Database not configured' });
 
+  // Company accounts can only create devices for their own facility
+  var coBulk = companyScope(req);
+  if (coBulk) {
+    items.forEach(function(it) { it.company_id = coBulk; });
+  }
   // Validate each item before inserting
   for (var i = 0; i < items.length; i++) {
     if (!items[i].device_id || !items[i].device_type) {
@@ -1200,7 +1249,14 @@ app.get('/api/client/inspections', authMiddleware, async function(req, res) {
   try {
     var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
     var result;
-    if (req.user.user_type === 'sub_user') {
+    var coScope = companyScope(req);
+    if (coScope) {
+      // Production company account: only their own facility's inspections
+      result = await p.query(
+        'SELECT * FROM inspections WHERE client_id=$1 AND company_id=$2 ORDER BY created_at DESC LIMIT $3',
+        [req.user.id, coScope, limit]
+      );
+    } else if (req.user.user_type === 'sub_user') {
       // Technicians only see their own submissions
       result = await p.query(
         'SELECT * FROM inspections WHERE client_id=$1 AND sub_user_id=$2 ORDER BY created_at DESC LIMIT $3',
@@ -1229,13 +1285,22 @@ app.post('/api/client/inspections', authMiddleware, async function(req, res) {
       var dup = await p.query('SELECT id FROM inspections WHERE client_id=$1 AND offline_key=$2', [req.user.id, b.offline_key]);
       if (dup.rows.length) return res.json(Object.assign({duplicate:true}, dup.rows[0]));
     }
+    // Determine which company this inspection belongs to
+    var inspCompanyId = companyScope(req);
+    if (!inspCompanyId) {
+      try {
+        var devLookup = await p.query('SELECT company_id FROM devices WHERE device_id=$1 AND client_id=$2 LIMIT 1', [b.device_id, req.user.id]);
+        if (devLookup.rows.length) inspCompanyId = devLookup.rows[0].company_id;
+      } catch(e) { inspCompanyId = null; }
+    }
     var result = await p.query(
-      'INSERT INTO inspections (client_id,device_id,device_type,zone,status,deficiency_type,notes,photo_url,gps_lat,gps_lng,inspector,tour_id,findings,offline_key,sub_user_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *',
+      'INSERT INTO inspections (client_id,device_id,device_type,zone,status,deficiency_type,notes,photo_url,gps_lat,gps_lng,inspector,tour_id,findings,offline_key,sub_user_id,company_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *',
       [req.user.id, b.device_id, b.device_type||'', b.zone||'', b.status,
        b.deficiency_type||null, b.notes||null, b.photo_url||null,
        b.gps_lat||null, b.gps_lng||null, b.inspector||'', b.tour_id||null,
        b.findings ? JSON.stringify(b.findings) : null, b.offline_key||null,
-       req.user.user_type === 'sub_user' ? req.user.sub_user_id : null]
+       req.user.user_type === 'sub_user' ? req.user.sub_user_id : null,
+       inspCompanyId || null]
     );
     var insp = result.rows[0];
     var ca = null;
@@ -1259,7 +1324,16 @@ app.get('/api/client/corrective-actions', authMiddleware, async function(req, re
   try {
     var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
     var result;
-    if (req.user.user_type === 'sub_user') {
+    var coScopeCA = companyScope(req);
+    if (coScopeCA) {
+      // Production company account: only their own facility's corrective actions
+      result = await p.query(
+        'SELECT ca.* FROM corrective_actions ca ' +
+        'LEFT JOIN devices d ON d.device_id = ca.device_id AND d.client_id = ca.client_id ' +
+        'WHERE ca.client_id=$1 AND (ca.company_id=$2 OR d.company_id=$2) ORDER BY ca.created_at DESC',
+        [req.user.id, coScopeCA]
+      );
+    } else if (req.user.user_type === 'sub_user') {
       // Technicians only see CAs generated from their own inspections
       result = await p.query(
         'SELECT ca.* FROM corrective_actions ca ' +
@@ -1299,7 +1373,25 @@ app.patch('/api/client/corrective-actions/:id', authMiddleware, async function(r
 // ── CLIENT: DASHBOARD ─────────────────────────────────
 app.get('/api/client/dashboard', authMiddleware, async function(req, res) {
   var cid = req.user.id;
+  var coDash = companyScope(req);
   try {
+    if (coDash) {
+      // Production company account: scope everything to their facility
+      var p2 = getPool();
+      var dInsp = await p2.query("SELECT status, COUNT(*) AS cnt FROM inspections WHERE client_id=$1 AND company_id=$2 AND created_at>NOW()-INTERVAL '30 days' GROUP BY status", [cid, coDash]);
+      var dCas  = await p2.query('SELECT ca.status, ca.severity, COUNT(*) AS cnt FROM corrective_actions ca LEFT JOIN devices d ON d.device_id=ca.device_id AND d.client_id=ca.client_id WHERE ca.client_id=$1 AND (ca.company_id=$2 OR d.company_id=$2) GROUP BY ca.status, ca.severity', [cid, coDash]);
+      var dDev  = await p2.query('SELECT COUNT(*) AS cnt FROM devices WHERE client_id=$1 AND company_id=$2 AND active=TRUE', [cid, coDash]);
+      var dZone = await p2.query("SELECT zone, COUNT(*) AS total, COUNT(*) FILTER(WHERE status='Good') AS good FROM inspections WHERE client_id=$1 AND company_id=$2 AND created_at>NOW()-INTERVAL '30 days' GROUP BY zone ORDER BY zone", [cid, coDash]);
+      var dTot=0,dGood=0,dNg=0,dMon=0;
+      dInsp.rows.forEach(function(r){ var n=parseInt(r.cnt); dTot+=n; if(r.status==='Good')dGood+=n; else if(r.status==='Not Good')dNg+=n; else dMon+=n; });
+      return res.json({
+        inspections: { total:dTot, good:dGood, not_good:dNg, monitor:dMon },
+        compliance_rate: dTot ? Math.round(dGood/dTot*100) : null,
+        cas: dCas.rows,
+        devices: parseInt(dDev.rows[0].cnt),
+        zones: dZone.rows.map(function(z){ return { zone:z.zone, total:parseInt(z.total), good:parseInt(z.good) }; })
+      });
+    }
     var insps   = await getPool().query('SELECT status, COUNT(*) AS cnt FROM inspections WHERE client_id=$1 AND created_at>NOW()-INTERVAL \'30 days\' GROUP BY status', [cid]);
     var cas     = await getPool().query('SELECT status, severity, COUNT(*) AS cnt FROM corrective_actions WHERE client_id=$1 GROUP BY status,severity', [cid]);
     var devices = await getPool().query('SELECT COUNT(*) AS cnt FROM devices WHERE client_id=$1 AND active=TRUE', [cid]);
@@ -1373,7 +1465,7 @@ app.get('/api/client/users', authMiddleware, async function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/client/users', authMiddleware, mainAccountOnly, async function(req, res) {
+app.post('/api/client/users', authMiddleware, mainAccountOnly, pestControlOnly, async function(req, res) {
   var b = req.body;
   if (!b.username || !b.password)
     return res.status(400).json({ error: 'Username and password required' });
@@ -1403,7 +1495,7 @@ app.post('/api/client/users', authMiddleware, mainAccountOnly, async function(re
   }
 });
 
-app.patch('/api/client/users/:id', authMiddleware, mainAccountOnly, async function(req, res) {
+app.patch('/api/client/users/:id', authMiddleware, mainAccountOnly, pestControlOnly, async function(req, res) {
   var b = req.body;
   if (b.new_password) {
     var pwE = checkPasswordStrength(b.new_password);
@@ -1427,7 +1519,7 @@ app.patch('/api/client/users/:id', authMiddleware, mainAccountOnly, async functi
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/client/users/:id', authMiddleware, mainAccountOnly, async function(req, res) {
+app.delete('/api/client/users/:id', authMiddleware, mainAccountOnly, pestControlOnly, async function(req, res) {
   try {
     await getPool().query('DELETE FROM client_users WHERE id=$1 AND client_id=$2', [req.params.id, req.user.id]);
     res.json({ ok: true });
