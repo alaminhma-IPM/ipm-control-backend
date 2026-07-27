@@ -1385,12 +1385,26 @@ app.post('/api/client/inspections', authMiddleware, async function(req, res) {
       var dup = await p.query('SELECT id FROM inspections WHERE client_id=$1 AND offline_key=$2', [req.user.id, b.offline_key]);
       if (dup.rows.length) return res.json(Object.assign({duplicate:true}, dup.rows[0]));
     }
-    // Determine which company this inspection belongs to
+    // Determine which company this inspection belongs to.
+    // Priority: (1) company account scope, (2) the tour's company, (3) device lookup.
     var inspCompanyId = companyScope(req);
+    if (!inspCompanyId && b.tour_id) {
+      try {
+        var tourLookup = await p.query('SELECT company_id FROM inspection_tours WHERE id=$1 AND client_id=$2', [b.tour_id, req.user.id]);
+        if (tourLookup.rows.length && tourLookup.rows[0].company_id) inspCompanyId = tourLookup.rows[0].company_id;
+      } catch(e) {}
+    }
     if (!inspCompanyId) {
       try {
-        var devLookup = await p.query('SELECT company_id FROM devices WHERE device_id=$1 AND client_id=$2 LIMIT 1', [b.device_id, req.user.id]);
-        if (devLookup.rows.length) inspCompanyId = devLookup.rows[0].company_id;
+        // If a company_id was passed explicitly, prefer the device in that company
+        if (b.company_id) {
+          var devScoped = await p.query('SELECT company_id FROM devices WHERE device_id=$1 AND client_id=$2 AND company_id=$3 LIMIT 1', [b.device_id, req.user.id, b.company_id]);
+          if (devScoped.rows.length) inspCompanyId = devScoped.rows[0].company_id;
+        }
+        if (!inspCompanyId) {
+          var devLookup = await p.query('SELECT company_id FROM devices WHERE device_id=$1 AND client_id=$2 AND company_id IS NOT NULL LIMIT 1', [b.device_id, req.user.id]);
+          if (devLookup.rows.length) inspCompanyId = devLookup.rows[0].company_id;
+        }
       } catch(e) { inspCompanyId = null; }
     }
     var result = await p.query(
@@ -1485,6 +1499,44 @@ app.get('/api/client/dashboard', authMiddleware, async function(req, res) {
   var cid = req.user.id;
   var coDash = companyScope(req);
   try {
+    // Technician (sub_user): scope to their own inspections + assigned companies
+    if (req.user.user_type === 'sub_user') {
+      var pt = getPool();
+      var suid = req.user.sub_user_id;
+      var tInsp = await pt.query(
+        "SELECT status, COUNT(*) AS cnt FROM inspections WHERE client_id=$1 AND sub_user_id=$2 AND created_at>NOW()-INTERVAL '30 days' GROUP BY status",
+        [cid, suid]
+      );
+      var tToday = await pt.query(
+        "SELECT COUNT(*) AS cnt FROM inspections WHERE client_id=$1 AND sub_user_id=$2 AND created_at::date = NOW()::date",
+        [cid, suid]
+      );
+      var tCompanies = await pt.query(
+        'SELECT COUNT(*) AS cnt FROM user_companies WHERE sub_user_id=$1', [suid]
+      );
+      var tTours = await pt.query(
+        "SELECT COUNT(*) AS cnt FROM inspection_tours t WHERE t.client_id=$1 AND t.status='in_progress' AND " +
+        "(t.started_by=$2 OR EXISTS(SELECT 1 FROM user_companies uc WHERE uc.company_id=t.company_id AND uc.sub_user_id=$3))",
+        [cid, req.user.username, suid]
+      );
+      var tCas = await pt.query(
+        'SELECT ca.status, ca.severity, COUNT(*) AS cnt FROM corrective_actions ca ' +
+        'JOIN inspections i ON i.id = ca.inspection_id ' +
+        'WHERE ca.client_id=$1 AND i.sub_user_id=$2 GROUP BY ca.status, ca.severity',
+        [cid, suid]
+      );
+      var tt=0,tg=0,tng=0,tm=0;
+      tInsp.rows.forEach(function(r){ var n=parseInt(r.cnt); tt+=n; if(r.status==='Good')tg+=n; else if(r.status==='Not Good')tng+=n; else tm+=n; });
+      return res.json({
+        is_technician: true,
+        inspections: { total:tt, good:tg, not_good:tng, monitor:tm },
+        compliance_rate: tt ? Math.round(tg/tt*100) : null,
+        today_count: parseInt(tToday.rows[0].cnt),
+        assigned_companies: parseInt(tCompanies.rows[0].cnt),
+        active_tours: parseInt(tTours.rows[0].cnt),
+        cas: tCas.rows
+      });
+    }
     if (coDash) {
       // Production company account: scope everything to their facility
       var p2 = getPool();
