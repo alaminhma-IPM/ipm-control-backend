@@ -1356,9 +1356,14 @@ app.get('/api/client/inspections', authMiddleware, async function(req, res) {
     var result;
     var coScope = companyScope(req);
     if (coScope) {
-      // Production company account: only their own facility's inspections
+      // Production company account: their own facility's inspections.
+      // Primary match: inspection tagged with their company_id.
+      // Legacy fallback: inspections with NULL company_id whose device belongs to this company.
       result = await p.query(
-        'SELECT * FROM inspections WHERE client_id=$1 AND company_id=$2 ORDER BY created_at DESC LIMIT $3',
+        'SELECT DISTINCT i.* FROM inspections i ' +
+        'LEFT JOIN devices d ON d.device_id = i.device_id AND d.client_id = i.client_id AND d.company_id = $2 ' +
+        'WHERE i.client_id=$1 AND (i.company_id=$2 OR (i.company_id IS NULL AND d.id IS NOT NULL)) ' +
+        'ORDER BY i.created_at DESC LIMIT $3',
         [req.user.id, coScope, limit]
       );
     } else if (req.user.user_type === 'sub_user') {
@@ -1458,8 +1463,9 @@ app.get('/api/client/corrective-actions', authMiddleware, async function(req, re
       // Match strictly by the CA's own company_id, or (for legacy CAs with no company_id)
       // by a device that belongs to this company AND shares the same tour/inspection lineage.
       result = await p.query(
-        'SELECT ca.* FROM corrective_actions ca ' +
-        'WHERE ca.client_id=$1 AND ca.company_id=$2 ORDER BY ca.created_at DESC',
+        'SELECT DISTINCT ca.* FROM corrective_actions ca ' +
+        'LEFT JOIN devices d ON d.device_id = ca.device_id AND d.client_id = ca.client_id AND d.company_id = $2 ' +
+        'WHERE ca.client_id=$1 AND (ca.company_id=$2 OR (ca.company_id IS NULL AND d.id IS NOT NULL)) ORDER BY ca.created_at DESC',
         [req.user.id, coScopeCA]
       );
     } else if (req.user.user_type === 'sub_user') {
@@ -1500,6 +1506,33 @@ app.patch('/api/client/corrective-actions/:id', authMiddleware, async function(r
 });
 
 // ── CLIENT: DASHBOARD ─────────────────────────────────
+
+// ── DIAGNOSTIC: data linkage check (temporary debugging aid) ──
+app.get('/api/client/diag', authMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var out = { token: { user_type: req.user.user_type, company_id: req.user.company_id || null, sub_user_id: req.user.sub_user_id || null, portal_user_id: req.user.portal_user_id || null } };
+    var coScope = companyScope(req);
+    out.company_scope = coScope;
+    // Companies for this client
+    var comps = await p.query('SELECT id, company_name FROM companies WHERE client_id=$1', [req.user.id]);
+    out.companies = comps.rows;
+    // Inspection counts grouped by company_id
+    var insp = await p.query('SELECT company_id, COUNT(*) AS cnt FROM inspections WHERE client_id=$1 GROUP BY company_id', [req.user.id]);
+    out.inspections_by_company = insp.rows;
+    // CA counts grouped by company_id
+    var cas = await p.query('SELECT company_id, COUNT(*) AS cnt FROM corrective_actions WHERE client_id=$1 GROUP BY company_id', [req.user.id]);
+    out.cas_by_company = cas.rows;
+    // Devices grouped by company_id
+    var devs = await p.query('SELECT company_id, COUNT(*) AS cnt FROM devices WHERE client_id=$1 GROUP BY company_id', [req.user.id]);
+    out.devices_by_company = devs.rows;
+    // Technician assignments
+    var assigns = await p.query('SELECT uc.sub_user_id, uc.company_id, cu.username FROM user_companies uc LEFT JOIN client_users cu ON cu.id = uc.sub_user_id WHERE cu.client_id=$1', [req.user.id]);
+    out.technician_assignments = assigns.rows;
+    res.json(out);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/client/dashboard', authMiddleware, async function(req, res) {
   var cid = req.user.id;
   var coDash = companyScope(req);
@@ -1545,8 +1578,8 @@ app.get('/api/client/dashboard', authMiddleware, async function(req, res) {
     if (coDash) {
       // Production company account: scope everything to their facility
       var p2 = getPool();
-      var dInsp = await p2.query("SELECT status, COUNT(*) AS cnt FROM inspections WHERE client_id=$1 AND company_id=$2 AND created_at>NOW()-INTERVAL '30 days' GROUP BY status", [cid, coDash]);
-      var dCas  = await p2.query('SELECT ca.status, ca.severity, COUNT(*) AS cnt FROM corrective_actions ca WHERE ca.client_id=$1 AND ca.company_id=$2 GROUP BY ca.status, ca.severity', [cid, coDash]);
+      var dInsp = await p2.query("SELECT i.status, COUNT(*) AS cnt FROM inspections i LEFT JOIN devices d ON d.device_id=i.device_id AND d.client_id=i.client_id AND d.company_id=$2 WHERE i.client_id=$1 AND (i.company_id=$2 OR (i.company_id IS NULL AND d.id IS NOT NULL)) AND i.created_at>NOW()-INTERVAL '30 days' GROUP BY i.status", [cid, coDash]);
+      var dCas  = await p2.query('SELECT ca.status, ca.severity, COUNT(*) AS cnt FROM corrective_actions ca LEFT JOIN devices d ON d.device_id=ca.device_id AND d.client_id=ca.client_id AND d.company_id=$2 WHERE ca.client_id=$1 AND (ca.company_id=$2 OR (ca.company_id IS NULL AND d.id IS NOT NULL)) GROUP BY ca.status, ca.severity', [cid, coDash]);
       var dDev  = await p2.query('SELECT COUNT(*) AS cnt FROM devices WHERE client_id=$1 AND company_id=$2 AND active=TRUE', [cid, coDash]);
       var dZone = await p2.query("SELECT zone, COUNT(*) AS total, COUNT(*) FILTER(WHERE status='Good') AS good FROM inspections WHERE client_id=$1 AND company_id=$2 AND created_at>NOW()-INTERVAL '30 days' GROUP BY zone ORDER BY zone", [cid, coDash]);
       var dTot=0,dGood=0,dNg=0,dMon=0;
