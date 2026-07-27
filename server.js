@@ -550,10 +550,36 @@ app.post('/api/auth/login', async function(req, res) {
 app.get('/api/client/me', authMiddleware, async function(req, res) {
   try {
     var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
+    // Production company account: return their company context, not the pest control company
+    if (req.user.user_type === 'company_account') {
+      var coRes = await p.query(
+        'SELECT co.company_name AS production_company_name, co.id AS company_id, ' +
+        'c.plan, c.current_period_end, c.status AS client_status, c.logo_url, ' +
+        'pu.username, pu.full_name ' +
+        'FROM company_users pu ' +
+        'JOIN companies co ON co.id = pu.company_id ' +
+        'JOIN clients c ON c.id = pu.client_id ' +
+        'WHERE pu.id=$1', [req.user.portal_user_id]
+      );
+      if (!coRes.rows.length) return res.status(404).json({ error: 'Not found' });
+      var co = coRes.rows[0];
+      var daysC = Math.ceil((new Date(co.current_period_end) - new Date()) / 86400000);
+      return res.json({
+        id: req.user.id, username: co.username, full_name: co.full_name,
+        company_name: co.production_company_name, company_id: co.company_id,
+        plan: co.plan, current_period_end: co.current_period_end, logo_url: co.logo_url,
+        user_type: 'company_account', is_company_account: true,
+        days_left: daysC, expired: daysC <= 0
+      });
+    }
     var result = await p.query('SELECT * FROM clients WHERE id=$1', [req.user.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
     var safe = Object.assign({}, result.rows[0]);
     delete safe.password_hash;
+    if (req.user.user_type === 'sub_user') {
+      safe.user_type = 'sub_user'; safe.sub_user_id = req.user.sub_user_id;
+      safe.full_name = req.user.full_name || safe.full_name; safe.role = req.user.role || safe.role;
+    }
     var days = Math.ceil((new Date(safe.current_period_end) - new Date()) / 86400000);
     res.json(Object.assign(safe, { days_left: days, expired: days <= 0 }));
   } catch(e) {
