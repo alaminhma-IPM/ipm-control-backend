@@ -1761,12 +1761,17 @@ app.get('/api/client/dashboard', authMiddleware, async function(req, res) {
       var dZone = await p2.query("SELECT zone, COUNT(*) AS total, COUNT(*) FILTER(WHERE status='Good') AS good FROM inspections WHERE client_id=$1 AND company_id=$2 AND created_at>NOW()-INTERVAL '30 days' GROUP BY zone ORDER BY zone", [cid, coDash]);
       var dTot=0,dGood=0,dNg=0,dMon=0;
       dInsp.rows.forEach(function(r){ var n=parseInt(r.cnt); dTot+=n; if(r.status==='Good')dGood+=n; else if(r.status==='Not Good')dNg+=n; else dMon+=n; });
+      var dTL = await p2.query('SELECT team_leader_name, team_leader_phone, team_leader_email FROM companies WHERE id=$1', [coDash]);
+      var tlRow = dTL.rows[0] || {};
       return res.json({
         inspections: { total:dTot, good:dGood, not_good:dNg, monitor:dMon },
         compliance_rate: dTot ? Math.round(dGood/dTot*100) : null,
         cas: dCas.rows,
         devices: parseInt(dDev.rows[0].cnt),
-        zones: dZone.rows.map(function(z){ return { zone:z.zone, total:parseInt(z.total), good:parseInt(z.good) }; })
+        zones: dZone.rows.map(function(z){ return { zone:z.zone, total:parseInt(z.total), good:parseInt(z.good) }; }),
+        team_leader_name: tlRow.team_leader_name || null,
+        team_leader_phone: tlRow.team_leader_phone || null,
+        team_leader_email: tlRow.team_leader_email || null
       });
     }
     var insps   = await getPool().query('SELECT status, COUNT(*) AS cnt FROM inspections WHERE client_id=$1 AND created_at>NOW()-INTERVAL \'30 days\' GROUP BY status', [cid]);
