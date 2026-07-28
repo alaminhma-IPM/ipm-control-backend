@@ -827,8 +827,30 @@ app.patch('/api/client/tours/:id/complete', authMiddleware, async function(req, 
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-
-// ── CHEMICAL APPLICATION LOG ──────────────────────────
+// Edit tour name / zone
+app.patch('/api/client/tours/:id', authMiddleware, async function(req, res) {
+  var b = req.body;
+  try {
+    var p = getPool();
+    var updates = [], vals = [], i = 1;
+    ['tour_name','zone'].forEach(function(f){
+      if (b[f] !== undefined) { updates.push(f+'=$'+i++); vals.push(b[f]); }
+    });
+    if (!updates.length) return res.status(400).json({ error: 'No fields to update' });
+    updates.push('updated_at=NOW()');
+    vals.push(req.params.id); vals.push(req.user.id);
+    // Scope to the production company's own tours when applicable
+    var coScope = companyScope(req);
+    var scopeClause = '';
+    if (coScope) { scopeClause = ' AND company_id=$'+(i+2); vals.push(coScope); }
+    var result = await p.query(
+      'UPDATE inspection_tours SET ' + updates.join(',') + ' WHERE id=$'+i+' AND client_id=$'+(i+1) + scopeClause + ' RETURNING *',
+      vals
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Tour not found' });
+    res.json(result.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 app.get('/api/client/chemicals', authMiddleware, async function(req, res) {
   try {
     var result;
