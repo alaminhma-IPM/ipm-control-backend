@@ -85,9 +85,7 @@ async function ensureCompaniesSchema() {
     "UPDATE inspection_tours SET company_id = (SELECT co.id FROM companies co WHERE co.client_id = inspection_tours.client_id ORDER BY co.created_at FETCH FIRST ROW ONLY) WHERE company_id IS NULL",
     "CREATE TABLE IF NOT EXISTS company_users (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE, client_id UUID NOT NULL REFERENCES clients(id) ON DELETE CASCADE, username VARCHAR(80) NOT NULL, password_hash TEXT NOT NULL, full_name VARCHAR(150), email VARCHAR(150), role VARCHAR(30) DEFAULT 'portal_viewer', active BOOLEAN DEFAULT TRUE, created_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(client_id, username))",
     "CREATE INDEX IF NOT EXISTS idx_company_users_company ON company_users(company_id)",
-    "CREATE INDEX IF NOT EXISTS idx_company_users_client ON company_users(client_id)",
-    "ALTER TABLE client_documents ADD COLUMN IF NOT EXISTS company_id UUID REFERENCES companies(id) ON DELETE SET NULL",
-    "CREATE INDEX IF NOT EXISTS idx_docs_company ON client_documents(company_id)"
+    "CREATE INDEX IF NOT EXISTS idx_company_users_client ON company_users(client_id)"
   ];
   for (var i = 0; i < steps.length; i++) {
     try {
@@ -191,19 +189,9 @@ function mainAccountOnly(req, res, next) {
 
 // ── COMPANY SCOPING ───────────────────────────────────
 // Production Company accounts are hard-scoped to their own company_id.
-// Pest control admins (client_main) may additionally act on behalf of one of
-// their own production companies by sending X-Acting-Company-Id — used when
-// they "enter" a company's workspace from the Companies list. This is safe:
-// every query that calls companyScope() also filters by client_id=req.user.id,
-// so an id for a company outside their tenant simply matches zero rows.
-// Returns the company_id to filter by, or null for the pest-control-wide view.
+// Returns the company_id to filter by, or null for pest-control accounts.
 function companyScope(req) {
-  if (req.user && req.user.user_type === 'company_account') return req.user.company_id;
-  if (req.user && req.user.user_type === 'client_main') {
-    var acting = req.headers && req.headers['x-acting-company-id'];
-    if (acting) return acting;
-  }
-  return null;
+  return (req.user && req.user.user_type === 'company_account') ? req.user.company_id : null;
 }
 
 // Blocks production-company accounts from pest-control-only features
@@ -471,8 +459,6 @@ app.post('/api/auth/login', async function(req, res) {
       );
       var safe = Object.assign({}, client);
       delete safe.password_hash;
-      safe.user_type = 'client_main';
-      safe.company_id = null; // pest control admin is not scoped to a single production company
       return res.json({ token: token, client: safe, expired: days <= 0 });
     }
 
@@ -1551,6 +1537,65 @@ app.get('/api/client/diag', authMiddleware, async function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+
+// ── PRODUCTION COMPANY: report grouped by inspector ──
+app.get('/api/client/inspector-report', authMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var coScope = companyScope(req);
+    var cid = req.user.id;
+    // Pull this account's inspections (scoped to their company if a production company)
+    var inspQuery, inspParams;
+    if (coScope) {
+      inspQuery = 'SELECT i.* FROM inspections i ' +
+        'LEFT JOIN devices d ON d.device_id = i.device_id AND d.client_id = i.client_id AND d.company_id = $2 ' +
+        "WHERE i.client_id=$1 AND (i.company_id=$2 OR (i.company_id IS NULL AND d.id IS NOT NULL)) " +
+        "AND i.created_at > NOW() - INTERVAL '90 days' ORDER BY i.created_at DESC";
+      inspParams = [cid, coScope];
+    } else {
+      inspQuery = "SELECT * FROM inspections WHERE client_id=$1 AND created_at > NOW() - INTERVAL '90 days' ORDER BY created_at DESC";
+      inspParams = [cid];
+    }
+    var insps = await p.query(inspQuery, inspParams);
+
+    // Group by inspector (prefer sub_user_id, fall back to the inspector name string)
+    var groups = {};
+    insps.rows.forEach(function(r) {
+      var key = r.sub_user_id || ('name:' + (r.inspector || 'Unknown'));
+      if (!groups[key]) groups[key] = { sub_user_id: r.sub_user_id || null, inspector_name: r.inspector || 'Unknown', total: 0, good: 0, not_good: 0, monitor: 0, last_date: null, inspections: [] };
+      var g = groups[key];
+      g.total++;
+      if (r.status === 'Good') g.good++;
+      else if (r.status === 'Not Good') g.not_good++;
+      else g.monitor++;
+      if (!g.last_date || new Date(r.created_at) > new Date(g.last_date)) g.last_date = r.created_at;
+      if (g.inspections.length < 100) g.inspections.push({ device_id: r.device_id, zone: r.zone, status: r.status, deficiency_type: r.deficiency_type, created_at: r.created_at });
+    });
+
+    // Resolve real names for sub_user_id keys
+    var subIds = Object.values(groups).filter(function(g){ return g.sub_user_id; }).map(function(g){ return g.sub_user_id; });
+    if (subIds.length) {
+      var names = await p.query('SELECT id, full_name, username, role FROM client_users WHERE id = ANY($1)', [subIds]);
+      var nameMap = {};
+      names.rows.forEach(function(u){ nameMap[u.id] = u; });
+      Object.values(groups).forEach(function(g){
+        if (g.sub_user_id && nameMap[g.sub_user_id]) {
+          var u = nameMap[g.sub_user_id];
+          g.inspector_name = u.full_name || u.username;
+          g.role = u.role;
+        }
+      });
+    }
+
+    var list = Object.values(groups).map(function(g){
+      g.compliance_rate = g.total ? Math.round((g.good / g.total) * 100) : null;
+      return g;
+    }).sort(function(a,b){ return b.total - a.total; });
+
+    res.json({ inspectors: list, period_days: 90, total_inspections: insps.rows.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/client/dashboard', authMiddleware, async function(req, res) {
   var cid = req.user.id;
   var coDash = companyScope(req);
@@ -1631,20 +1676,6 @@ app.get('/api/client/dashboard', authMiddleware, async function(req, res) {
 });
 
 // ── CLIENT: ME ────────────────────────────────────────
-app.get('/api/client/me', authMiddleware, async function(req, res) {
-  try {
-    var p = getPool(); if(!p) return res.status(500).json({error:"Database not configured. Add DATABASE_URL to Railway Variables"});
-    var result = await p.query('SELECT * FROM clients WHERE id=$1', [req.user.id]);
-    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
-    var safe = Object.assign({}, result.rows[0]);
-    delete safe.password_hash;
-    var days = Math.ceil((new Date(safe.current_period_end) - new Date()) / 86400000);
-    res.json(Object.assign(safe, { days_left: days, expired: days <= 0 }));
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // ── CLIENT: CHANGE PASSWORD ───────────────────────────
 app.post('/api/client/change-password', authMiddleware, async function(req, res) {
   var oldPass = req.body.old_password || '';
@@ -1874,21 +1905,10 @@ app.get('/api/owner/stats', ownerMiddleware, async function(req, res) {
 app.get('/api/client/documents', authMiddleware, async function(req, res) {
   try {
     var p = getPool();
-    var coDocs = companyScope(req);
-    var result;
-    if (coDocs) {
-      // Scoped to one production company: show that company's docs plus any
-      // shared/company-wide docs (company_id IS NULL) uploaded by pest control.
-      result = await p.query(
-        'SELECT * FROM client_documents WHERE client_id=$1 AND (company_id=$2 OR company_id IS NULL) ORDER BY created_at DESC',
-        [req.user.id, coDocs]
-      );
-    } else {
-      result = await p.query(
-        'SELECT * FROM client_documents WHERE client_id=$1 ORDER BY created_at DESC',
-        [req.user.id]
-      );
-    }
+    var result = await p.query(
+      'SELECT * FROM client_documents WHERE client_id=$1 ORDER BY created_at DESC',
+      [req.user.id]
+    );
     res.json(result.rows);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1901,10 +1921,9 @@ app.post('/api/client/documents', authMiddleware, mainAccountOnly, async functio
     return res.status(400).json({ error: 'doc_type must be msds, layout, or other' });
   try {
     var p = getPool();
-    var docCompanyId = b.company_id || companyScope(req) || null;
     var result = await p.query(
-      'INSERT INTO client_documents (client_id, name, doc_type, file_data, file_type, uploaded_by, company_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,name,doc_type,file_type,uploaded_by,created_at,company_id',
-      [req.user.id, b.name, b.doc_type, b.file_data, b.file_type||'application/pdf', b.uploaded_by||req.user.username, docCompanyId]
+      'INSERT INTO client_documents (client_id, name, doc_type, file_data, file_type, uploaded_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,name,doc_type,file_type,uploaded_by,created_at',
+      [req.user.id, b.name, b.doc_type, b.file_data, b.file_type||'application/pdf', b.uploaded_by||req.user.username]
     );
     res.json(result.rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
