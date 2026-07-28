@@ -65,8 +65,14 @@ async function ensureCompaniesSchema() {
   var steps = [
     "CREATE TABLE IF NOT EXISTS companies (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), client_id UUID REFERENCES clients(id) ON DELETE CASCADE, company_name VARCHAR(200) NOT NULL, address TEXT, contact_name VARCHAR(150), contact_phone VARCHAR(50), contact_email VARCHAR(150), industry VARCHAR(100), notes TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())",
     "CREATE INDEX IF NOT EXISTS idx_companies_client ON companies(client_id)",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS team_leader_name VARCHAR(120)",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS team_leader_phone VARCHAR(60)",
+    "ALTER TABLE companies ADD COLUMN IF NOT EXISTS team_leader_email VARCHAR(160)",
     "CREATE TABLE IF NOT EXISTS user_companies (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), sub_user_id UUID REFERENCES client_users(id) ON DELETE CASCADE, company_id UUID REFERENCES companies(id) ON DELETE CASCADE, created_at TIMESTAMPTZ DEFAULT NOW(), UNIQUE(sub_user_id, company_id))",
     "CREATE INDEX IF NOT EXISTS idx_usercomp_user ON user_companies(sub_user_id)",
+    "CREATE TABLE IF NOT EXISTS technician_appraisals (id UUID PRIMARY KEY DEFAULT uuid_generate_v4(), client_id UUID REFERENCES clients(id) ON DELETE CASCADE, company_id UUID REFERENCES companies(id) ON DELETE CASCADE, sub_user_id UUID REFERENCES client_users(id) ON DELETE CASCADE, period_label VARCHAR(40), rating INTEGER, punctuality INTEGER, quality INTEGER, thoroughness INTEGER, communication INTEGER, strengths TEXT, improvements TEXT, comments TEXT, auto_total_inspections INTEGER, auto_compliance_rate INTEGER, created_by VARCHAR(120), created_at TIMESTAMPTZ DEFAULT NOW())",
+    "CREATE INDEX IF NOT EXISTS idx_appraisals_company ON technician_appraisals(company_id)",
+    "CREATE INDEX IF NOT EXISTS idx_appraisals_subuser ON technician_appraisals(sub_user_id)",
     "CREATE INDEX IF NOT EXISTS idx_usercomp_company ON user_companies(company_id)",
     "ALTER TABLE devices ADD COLUMN IF NOT EXISTS company_id UUID REFERENCES companies(id) ON DELETE SET NULL",
     "ALTER TABLE inspection_tours ADD COLUMN IF NOT EXISTS company_id UUID REFERENCES companies(id) ON DELETE SET NULL",
@@ -564,6 +570,7 @@ app.get('/api/client/me', authMiddleware, async function(req, res) {
     if (req.user.user_type === 'company_account' || req.user.user_type === 'portal_user' || req.user.portal_user_id) {
       var coRes = await p.query(
         'SELECT co.company_name AS production_company_name, co.id AS company_id, ' +
+        'co.team_leader_name, co.team_leader_phone, co.team_leader_email, ' +
         'c.plan, c.current_period_end, c.status AS client_status, c.logo_url, ' +
         'pu.username, pu.full_name ' +
         'FROM company_users pu ' +
@@ -577,6 +584,9 @@ app.get('/api/client/me', authMiddleware, async function(req, res) {
       return res.json({
         id: req.user.id, username: co.username, full_name: co.full_name,
         company_name: co.production_company_name, company_id: co.company_id,
+        team_leader_name: co.team_leader_name || null,
+        team_leader_phone: co.team_leader_phone || null,
+        team_leader_email: co.team_leader_email || null,
         plan: co.plan, current_period_end: co.current_period_end, logo_url: co.logo_url,
         user_type: 'company_account', is_company_account: true,
         days_left: daysC, expired: daysC <= 0
@@ -1111,7 +1121,7 @@ app.patch('/api/client/companies/:id', authMiddleware, mainAccountOnly, async fu
   var b = req.body;
   try {
     var updates = [], vals = [], i = 1;
-    ['company_name','address','contact_name','contact_phone','contact_email','industry','notes'].forEach(function(f) {
+    ['company_name','address','contact_name','contact_phone','contact_email','industry','notes','team_leader_name','team_leader_phone','team_leader_email'].forEach(function(f) {
       if (b[f] !== undefined) { updates.push(f+'=$'+i++); vals.push(b[f]); }
     });
     if (!updates.length) return res.status(400).json({ error: 'No fields to update' });
@@ -1537,6 +1547,110 @@ app.get('/api/client/diag', authMiddleware, async function(req, res) {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+
+function CUR_USER_NAME(req) {
+  return (req.user && (req.user.full_name || req.user.username)) || 'Production Company';
+}
+
+
+// ── TECHNICIAN APPRAISALS (production company only) ──
+// List appraisals, optionally for a specific technician
+app.get('/api/client/appraisals', authMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var coScope = companyScope(req);
+    if (!coScope) return res.status(403).json({ error: 'Only production company accounts can view appraisals' });
+    var params = [req.user.id, coScope];
+    var sql = 'SELECT a.*, cu.full_name, cu.username FROM technician_appraisals a ' +
+      'LEFT JOIN client_users cu ON cu.id = a.sub_user_id ' +
+      'WHERE a.client_id=$1 AND a.company_id=$2';
+    if (req.query.sub_user_id) { sql += ' AND a.sub_user_id=$3'; params.push(req.query.sub_user_id); }
+    sql += ' ORDER BY a.created_at DESC';
+    var result = await p.query(sql, params);
+    res.json(result.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Create an appraisal
+app.post('/api/client/appraisals', authMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var coScope = companyScope(req);
+    if (!coScope) return res.status(403).json({ error: 'Only production company accounts can create appraisals' });
+    var b = req.body;
+    if (!b.sub_user_id) return res.status(400).json({ error: 'Please select a technician' });
+    // Compute auto-stats for this technician in this company
+    var stats = await p.query(
+      "SELECT COUNT(*) AS total, COUNT(*) FILTER(WHERE status='Good') AS good " +
+      "FROM inspections WHERE client_id=$1 AND company_id=$2 AND sub_user_id=$3",
+      [req.user.id, coScope, b.sub_user_id]
+    );
+    var total = parseInt(stats.rows[0].total) || 0;
+    var good = parseInt(stats.rows[0].good) || 0;
+    var compRate = total ? Math.round(good/total*100) : null;
+    var result = await p.query(
+      'INSERT INTO technician_appraisals (client_id, company_id, sub_user_id, period_label, rating, punctuality, quality, thoroughness, communication, strengths, improvements, comments, auto_total_inspections, auto_compliance_rate, created_by) ' +
+      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *',
+      [req.user.id, coScope, b.sub_user_id, b.period_label||'', b.rating||null, b.punctuality||null, b.quality||null, b.thoroughness||null, b.communication||null,
+       b.strengths||'', b.improvements||'', b.comments||'', total, compRate, (CUR_USER_NAME(req))]
+    );
+    res.json(result.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Delete an appraisal
+app.delete('/api/client/appraisals/:id', authMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var coScope = companyScope(req);
+    if (!coScope) return res.status(403).json({ error: 'Not permitted' });
+    await p.query('DELETE FROM technician_appraisals WHERE id=$1 AND client_id=$2 AND company_id=$3', [req.params.id, req.user.id, coScope]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DATE-RANGE / PERIOD REPORT (production company) ──
+app.get('/api/client/period-report', authMiddleware, async function(req, res) {
+  try {
+    var p = getPool();
+    var coScope = companyScope(req);
+    var cid = req.user.id;
+    // Accept ?from=YYYY-MM-DD&to=YYYY-MM-DD, default last 30 days
+    var from = req.query.from || null;
+    var to = req.query.to || null;
+    var whereDate = '', dateParams = [];
+    var baseParams = coScope ? [cid, coScope] : [cid];
+    var companyFilter = coScope
+      ? 'i.client_id=$1 AND (i.company_id=$2 OR (i.company_id IS NULL AND EXISTS(SELECT 1 FROM devices d WHERE d.device_id=i.device_id AND d.client_id=i.client_id AND d.company_id=$2)))'
+      : 'i.client_id=$1';
+    var pIdx = baseParams.length;
+    if (from) { pIdx++; whereDate += ' AND i.created_at >= $' + pIdx; baseParams.push(from); }
+    if (to) { pIdx++; whereDate += ' AND i.created_at < ($' + pIdx + '::date + INTERVAL \'1 day\')'; baseParams.push(to); }
+
+    // Daily breakdown
+    var daily = await p.query(
+      "SELECT i.created_at::date AS day, COUNT(*) AS total, " +
+      "COUNT(*) FILTER(WHERE i.status='Good') AS good, " +
+      "COUNT(*) FILTER(WHERE i.status='Not Good') AS not_good, " +
+      "COUNT(*) FILTER(WHERE i.status='Monitor') AS monitor " +
+      "FROM inspections i WHERE " + companyFilter + whereDate + " GROUP BY i.created_at::date ORDER BY day DESC",
+      baseParams
+    );
+    // Monthly breakdown
+    var monthly = await p.query(
+      "SELECT to_char(i.created_at, 'YYYY-MM') AS month, COUNT(*) AS total, " +
+      "COUNT(*) FILTER(WHERE i.status='Good') AS good, " +
+      "COUNT(*) FILTER(WHERE i.status='Not Good') AS not_good, " +
+      "COUNT(*) FILTER(WHERE i.status='Monitor') AS monitor " +
+      "FROM inspections i WHERE " + companyFilter + whereDate + " GROUP BY to_char(i.created_at, 'YYYY-MM') ORDER BY month DESC",
+      baseParams
+    );
+    res.json({
+      daily: daily.rows.map(function(r){ return { day: r.day, total: +r.total, good: +r.good, not_good: +r.not_good, monitor: +r.monitor, compliance: r.total>0?Math.round(r.good/r.total*100):null }; }),
+      monthly: monthly.rows.map(function(r){ return { month: r.month, total: +r.total, good: +r.good, not_good: +r.not_good, monitor: +r.monitor, compliance: r.total>0?Math.round(r.good/r.total*100):null }; })
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 // ── PRODUCTION COMPANY: report grouped by inspector ──
 app.get('/api/client/inspector-report', authMiddleware, async function(req, res) {
