@@ -1189,7 +1189,7 @@ app.get('/api/client/companies/:id/report', authMiddleware, mainAccountOnly, asy
     res.json({
       company: own.rows[0],
       inspections: { total:tot, good:good, not_good:ng, monitor:mon },
-      compliance_rate: tot ? Math.round(good/tot*100) : null,
+      compliance_rate: tot ? Math.round(good/tot*100) : 100,
       cas: cas.rows,
       devices: parseInt(dev.rows[0].cnt),
       zones: zones.rows.map(function(z){ return { zone:z.zone, total:parseInt(z.total), good:parseInt(z.good) }; }),
@@ -1724,7 +1724,7 @@ app.get('/api/client/inspector-report', authMiddleware, async function(req, res)
     }
 
     var list = Object.values(groups).map(function(g){
-      g.compliance_rate = g.total ? Math.round((g.good / g.total) * 100) : null;
+      g.compliance_rate = g.total ? Math.round((g.good / g.total) * 100) : 100;
       return g;
     }).sort(function(a,b){ return b.total - a.total; });
 
@@ -1767,7 +1767,7 @@ app.get('/api/client/dashboard', authMiddleware, async function(req, res) {
       return res.json({
         is_technician: true,
         inspections: { total:tt, good:tg, not_good:tng, monitor:tm },
-        compliance_rate: tt ? Math.round(tg/tt*100) : null,
+        compliance_rate: tt ? Math.round(tg/tt*100) : 100,
         today_count: parseInt(tToday.rows[0].cnt),
         assigned_companies: parseInt(tCompanies.rows[0].cnt),
         active_tours: parseInt(tTours.rows[0].cnt),
@@ -1787,7 +1787,7 @@ app.get('/api/client/dashboard', authMiddleware, async function(req, res) {
       var tlRow = dTL.rows[0] || {};
       return res.json({
         inspections: { total:dTot, good:dGood, not_good:dNg, monitor:dMon },
-        compliance_rate: dTot ? Math.round(dGood/dTot*100) : null,
+        compliance_rate: dTot ? Math.round(dGood/dTot*100) : 100,
         cas: dCas.rows,
         devices: parseInt(dDev.rows[0].cnt),
         zones: dZone.rows.map(function(z){ return { zone:z.zone, total:parseInt(z.total), good:parseInt(z.good) }; }),
@@ -1806,7 +1806,7 @@ app.get('/api/client/dashboard', authMiddleware, async function(req, res) {
     var good  = im['Good'] || 0;
     res.json({
       inspections:     { total: total, good: good, not_good: im['Not Good']||0, monitor: im['Monitor']||0 },
-      compliance_rate: total ? Math.round(good/total*100) : null,
+      compliance_rate: total ? Math.round(good/total*100) : 100,
       cas:             cas.rows,
       devices:         parseInt(devices.rows[0].cnt),
       zones:           zones.rows
