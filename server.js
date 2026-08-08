@@ -8,6 +8,8 @@ const { v4: uuidv4 } = require('uuid');
 const cookieParser = require('cookie-parser');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const { authenticator } = require('otplib');
+const QRCode = require('qrcode');
 
 const app = express();
 var PORT = parseInt(process.env.PORT) || 3000;
@@ -80,6 +82,16 @@ var ownerLoginLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many login attempts. Please try again in a few minutes.' }
+});
+// A 6-digit TOTP code has only 1,000,000 possible values — much smaller than
+// a password's search space — so this needs its own tighter limit rather
+// than reusing ownerLoginLimiter's budget.
+var owner2faLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many code attempts. Please try again in a few minutes.' }
 });
 
 // ── COOKIE OPTIONS ──────────────────────────────────────
@@ -349,6 +361,55 @@ function timingSafeStringEqual(a, b) {
   return crypto.timingSafeEqual(ha, hb);
 }
 
+// Allow one 30-second step of clock drift on either side when checking
+// TOTP codes — otherwise a phone/server clock that's a few seconds off
+// causes valid codes to be rejected.
+authenticator.options = { window: 1 };
+
+function issueOwnerSession(res, email) {
+  var token = jwt.sign({ role:'owner', email: email }, JWT_SECRET, { expiresIn:'12h' });
+  res.cookie('ipm_owner_token', token, cookieOpts(12 * 60 * 60 * 1000));
+  return res.json({ token: token, role: 'owner' });
+}
+
+// ── OWNER 2FA STATUS (public — tells the frontend whether to show a
+// code-entry step or a "set up 2FA" prompt; reveals no secret) ──
+app.get('/api/owner/2fa/status', function(req, res) {
+  res.json({ enabled: !!process.env.OWNER_TOTP_SECRET });
+});
+
+// ── OWNER 2FA SETUP ────────────────────────────────────
+// One-time use: works only while OWNER_TOTP_SECRET is NOT yet set in Railway
+// Variables. This is deliberate — once 2FA is configured, this endpoint
+// refuses to generate a new secret, so a stolen password alone can't be used
+// to silently re-pair 2FA to an attacker's device. To rotate the secret, the
+// owner must first remove OWNER_TOTP_SECRET from Railway Variables (proving
+// they have infrastructure access, not just the password) before calling
+// this again.
+app.post('/api/owner/2fa/setup', ownerLoginLimiter, async function(req, res) {
+  var email    = (req.body.email    || '').trim().toLowerCase();
+  var password = (req.body.password || '').trim();
+  var envEmail = (process.env.OWNER_EMAIL    || '').trim().toLowerCase();
+  var envPass  = (process.env.OWNER_PASSWORD || '').trim();
+  if (!envEmail || !envPass) {
+    return res.status(500).json({ error: 'Server config error: OWNER_EMAIL or OWNER_PASSWORD not set' });
+  }
+  if (!timingSafeStringEqual(email, envEmail) || !timingSafeStringEqual(password, envPass)) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  if (process.env.OWNER_TOTP_SECRET) {
+    return res.status(403).json({ error: '2FA is already configured. Remove OWNER_TOTP_SECRET from Railway Variables first if you need to re-pair a device.' });
+  }
+  try {
+    var secret = authenticator.generateSecret();
+    var otpauthUrl = authenticator.keyuri(email, 'APQS IPM Admin', secret);
+    var qrDataUrl = await QRCode.toDataURL(otpauthUrl);
+    res.json({ secret: secret, otpauth_url: otpauthUrl, qr_code_data_url: qrDataUrl });
+  } catch(e) {
+    res.status(500).json({ error: 'Could not generate 2FA setup: ' + e.message });
+  }
+});
+
 // ── OWNER LOGIN ───────────────────────────────────────
 app.post('/api/owner/login', ownerLoginLimiter, function(req, res) {
   var email    = (req.body.email    || '').trim().toLowerCase();
@@ -368,12 +429,46 @@ app.post('/api/owner/login', ownerLoginLimiter, function(req, res) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
   try {
-    var token = jwt.sign({ role:'owner', email: email }, JWT_SECRET, { expiresIn:'12h' });
-    res.cookie('ipm_owner_token', token, cookieOpts(12 * 60 * 60 * 1000));
-    res.json({ token: token, role: 'owner' });
+    // 2FA is opt-in via Railway Variables — if OWNER_TOTP_SECRET isn't set,
+    // behave exactly as before (password-only) so nothing breaks for anyone
+    // who hasn't run the setup flow yet.
+    if (!process.env.OWNER_TOTP_SECRET) {
+      return issueOwnerSession(res, email);
+    }
+    var preAuthToken = jwt.sign({ role: 'owner_pending_2fa', email: email }, JWT_SECRET, { expiresIn: '5m' });
+    res.json({ requires2fa: true, preAuthToken: preAuthToken });
   } catch(e) {
     res.status(500).json({ error: 'Token error: ' + e.message });
   }
+});
+
+// ── OWNER LOGIN: 2FA CODE VERIFICATION ─────────────────
+app.post('/api/owner/login/2fa', owner2faLimiter, function(req, res) {
+  var preAuthToken = req.body.preAuthToken || '';
+  var code = (req.body.code || '').trim();
+  if (!preAuthToken || !code) {
+    return res.status(400).json({ error: 'Missing verification code' });
+  }
+  var decoded;
+  try {
+    decoded = jwt.verify(preAuthToken, JWT_SECRET);
+  } catch(e) {
+    return res.status(401).json({ error: 'Login session expired — please sign in again' });
+  }
+  if (decoded.role !== 'owner_pending_2fa') {
+    return res.status(401).json({ error: 'Invalid login session' });
+  }
+  if (!process.env.OWNER_TOTP_SECRET) {
+    return res.status(500).json({ error: 'Server config error: 2FA secret not set' });
+  }
+  var valid = false;
+  try {
+    valid = authenticator.check(code, process.env.OWNER_TOTP_SECRET);
+  } catch(e) { valid = false; }
+  if (!valid) {
+    return res.status(401).json({ error: 'Invalid or expired code' });
+  }
+  issueOwnerSession(res, decoded.email);
 });
 
 app.post('/api/owner/logout', function(req, res) {
