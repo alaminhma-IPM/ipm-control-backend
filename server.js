@@ -3,14 +3,57 @@ const express = require('express');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
+const cookieParser = require('cookie-parser');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 var PORT = parseInt(process.env.PORT) || 3000;
+var IS_PROD = process.env.NODE_ENV === 'production';
+
+// ── JWT SECRET ─────────────────────────────────────────
+// Single source of truth. Previously two different hardcoded fallback strings
+// existed in different middlewares ('IPMControl2026DefaultSecret' vs
+// 'IPMControl2026Secret') — if JWT_SECRET was ever unset, tokens signed under
+// one fallback would silently fail to verify under the other. Consolidated here.
+var JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  if (IS_PROD) {
+    // Fail loudly rather than silently signing tokens with a guessable default
+    // in production — a predictable secret makes every issued token forgeable.
+    console.error('FATAL: JWT_SECRET is not set in Railway Variables. Refusing to start in production without it.');
+    process.exit(1);
+  }
+  console.warn('WARNING: JWT_SECRET not set — using an insecure dev-only fallback. Set JWT_SECRET in your .env before deploying.');
+  JWT_SECRET = 'dev-only-insecure-secret-do-not-use-in-production';
+}
+
+// ── ALLOWED ORIGINS (CORS) ────────────────────────────
+// Comma-separated list in Railway Variables, e.g.:
+// ALLOWED_ORIGINS=https://apqsipm.netlify.app,http://localhost:5173
+var ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://apqsipm.netlify.app,http://localhost:5000,http://localhost:5173')
+  .split(',').map(function(s){ return s.trim(); }).filter(Boolean);
+
+// ── SECURITY HEADERS ───────────────────────────────────
+app.use(helmet({
+  // This is a pure JSON API, not an HTML-serving app, so most of helmet's
+  // browser-facing directives (CSP, etc.) belong on the Netlify frontend
+  // instead — contentSecurityPolicy is disabled here to avoid conflicting
+  // with or duplicating the policy already set in the frontend's _headers file.
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' }
+}));
 
 // ── CORS ─────────────────────────────────────────────
 app.use(function(req, res, next) {
-  res.header('Access-Control-Allow-Origin', '*');
+  var origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.indexOf(origin) !== -1) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Vary', 'Origin');
+  }
+  res.header('Access-Control-Allow-Credentials', 'true');
   res.header('Access-Control-Allow-Methods', 'GET,POST,PATCH,DELETE,OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
@@ -18,6 +61,36 @@ app.use(function(req, res, next) {
 });
 
 app.use(express.json({ limit: '10mb' }));
+app.use(cookieParser());
+
+// ── RATE LIMITING ──────────────────────────────────────
+// Applied specifically to login endpoints — these are the highest-value
+// targets for credential stuffing / brute force, especially the owner login,
+// which is a single point of failure for every client on the platform.
+var loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,                   // 10 attempts per IP per window
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts. Please try again in a few minutes.' }
+});
+var ownerLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,                    // tighter — this is the admin account for the whole platform
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts. Please try again in a few minutes.' }
+});
+
+// ── COOKIE OPTIONS ──────────────────────────────────────
+// httpOnly: JS on the page (and therefore any XSS) cannot read the cookie.
+// secure: only sent over HTTPS (Railway + Netlify are both HTTPS).
+// sameSite 'none' is required because the frontend (Netlify) and backend
+// (Railway) are different origins — 'strict'/'lax' would silently block the
+// cookie from ever being sent cross-site.
+function cookieOpts(maxAgeMs) {
+  return { httpOnly: true, secure: true, sameSite: 'none', maxAge: maxAgeMs, path: '/' };
+}
 
 // ── DATABASE ──────────────────────────────────────────
 // Database connection - lazy initialization
@@ -208,13 +281,20 @@ function pestControlOnly(req, res, next) {
   next();
 }
 
-function authMiddleware(req, res, next) {
+// Reads the token from the httpOnly cookie first (new, secure path), and
+// falls back to the Authorization header (old path — keeps existing
+// frontend builds working until they're updated to rely on the cookie).
+function extractToken(req, cookieName) {
+  if (req.cookies && req.cookies[cookieName]) return req.cookies[cookieName];
   var header = req.headers.authorization || '';
-  var token = header.split(' ')[1];
+  return header.split(' ')[1];
+}
+
+function authMiddleware(req, res, next) {
+  var token = extractToken(req, 'ipm_token');
   if (!token) return res.status(401).json({ error: 'No token' });
   try {
-    var secret = process.env.JWT_SECRET || 'IPMControl2026DefaultSecret';
-    req.user = jwt.verify(token, secret);
+    req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch(e) {
     res.status(401).json({ error: 'Invalid token' });
@@ -222,12 +302,10 @@ function authMiddleware(req, res, next) {
 }
 
 function ownerMiddleware(req, res, next) {
-  var header = req.headers.authorization || '';
-  var token = header.split(' ')[1];
+  var token = extractToken(req, 'ipm_owner_token');
   if (!token) return res.status(401).json({ error: 'No token' });
   try {
-    var secret = process.env.JWT_SECRET || 'IPMControl2026DefaultSecret';
-    var decoded = jwt.verify(token, secret);
+    var decoded = jwt.verify(token, JWT_SECRET);
     if (decoded.role !== 'owner') return res.status(403).json({ error: 'Owner only' });
     req.user = decoded;
     next();
@@ -242,54 +320,65 @@ app.get('/api/health', function(req, res) {
 });
 
 // ── ENV DEBUG ─────────────────────────────────────────
-app.get('/api/debug/env', function(req, res) {
-  var email = process.env.OWNER_EMAIL || 'NOT_SET';
-  var pass  = process.env.OWNER_PASSWORD || 'NOT_SET';
-  var jwts  = process.env.JWT_SECRET || 'NOT_SET';
-  var db      = process.env.DATABASE_URL         || 'NOT_SET';
-  var dbpub   = process.env.DATABASE_PUBLIC_URL   || 'NOT_SET';
-  var dbpost  = process.env.POSTGRES_URL          || 'NOT_SET';
+// SECURITY: this used to be completely unauthenticated and returned the real
+// OWNER_EMAIL plus the password and JWT secret LENGTHS — enough for an
+// attacker to both learn the admin login identity and narrow a brute-force
+// search on the password without ever needing to log in. Now: owner-auth
+// required, production-disabled, and only ever reports SET/NOT_SET — never
+// values or lengths.
+app.get('/api/debug/env', ownerMiddleware, function(req, res) {
+  if (IS_PROD) return res.status(404).json({ error: 'Not found' });
   res.json({
-    OWNER_EMAIL:           email,
-    OWNER_EMAIL_LENGTH:    email.length,
-    OWNER_PASSWORD:        pass === 'NOT_SET' ? 'NOT_SET' : '*'.repeat(pass.length),
-    OWNER_PASSWORD_LENGTH: pass.length,
-    JWT_SECRET:            jwts === 'NOT_SET' ? 'NOT_SET' : 'SET_(' + jwts.length + '_chars)',
-    DATABASE_URL:          db     === 'NOT_SET' ? 'NOT_SET' : 'SET',
-    DATABASE_PUBLIC_URL:   dbpub  === 'NOT_SET' ? 'NOT_SET' : 'SET',
-    POSTGRES_URL:          dbpost === 'NOT_SET' ? 'NOT_SET' : 'SET',
-    NODE_ENV:              process.env.NODE_ENV || 'NOT_SET',
-    PORT:                  process.env.PORT     || 'NOT_SET',
-    ACTIVE_DB:             (db!=='NOT_SET'?'DATABASE_URL':dbpub!=='NOT_SET'?'DATABASE_PUBLIC_URL':dbpost!=='NOT_SET'?'POSTGRES_URL':'NONE_SET')
+    OWNER_EMAIL:         process.env.OWNER_EMAIL       ? 'SET' : 'NOT_SET',
+    OWNER_PASSWORD:      process.env.OWNER_PASSWORD    ? 'SET' : 'NOT_SET',
+    JWT_SECRET:          process.env.JWT_SECRET        ? 'SET' : 'NOT_SET',
+    DATABASE_URL:        process.env.DATABASE_URL      ? 'SET' : 'NOT_SET',
+    DATABASE_PUBLIC_URL: process.env.DATABASE_PUBLIC_URL ? 'SET' : 'NOT_SET',
+    POSTGRES_URL:        process.env.POSTGRES_URL      ? 'SET' : 'NOT_SET',
+    NODE_ENV:            process.env.NODE_ENV || 'NOT_SET',
+    PORT:                process.env.PORT     || 'NOT_SET'
   });
 });
 
+// Constant-time string compare (hash first so differing lengths don't
+// short-circuit early and leak timing information about *where* the
+// mismatch is). Plain === on secrets is a textbook timing side-channel.
+function timingSafeStringEqual(a, b) {
+  var ha = crypto.createHash('sha256').update(String(a)).digest();
+  var hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
 // ── OWNER LOGIN ───────────────────────────────────────
-app.post('/api/owner/login', function(req, res) {
+app.post('/api/owner/login', ownerLoginLimiter, function(req, res) {
   var email    = (req.body.email    || '').trim().toLowerCase();
   var password = (req.body.password || '').trim();
   var envEmail = (process.env.OWNER_EMAIL    || '').trim().toLowerCase();
   var envPass  = (process.env.OWNER_PASSWORD || '').trim();
-  var secret   = process.env.JWT_SECRET || 'IPMControl2026DefaultSecret';
-
-  console.log('Owner login attempt:', email);
-  console.log('OWNER_EMAIL set:', envEmail ? 'yes ('+envEmail.length+' chars)' : 'NO');
-  console.log('OWNER_PASSWORD set:', envPass ? 'yes ('+envPass.length+' chars)' : 'NO');
 
   if (!envEmail || !envPass) {
+    console.error('Owner login blocked: OWNER_EMAIL or OWNER_PASSWORD not set in Railway Variables');
     return res.status(500).json({
       error: 'Server config error: OWNER_EMAIL or OWNER_PASSWORD not set in Railway Variables'
     });
   }
-  if (email !== envEmail || password !== envPass) {
+  var emailOk = timingSafeStringEqual(email, envEmail);
+  var passOk  = timingSafeStringEqual(password, envPass);
+  if (!emailOk || !passOk) {
     return res.status(401).json({ error: 'Invalid credentials' });
   }
   try {
-    var token = jwt.sign({ role:'owner', email: email }, secret, { expiresIn:'12h' });
+    var token = jwt.sign({ role:'owner', email: email }, JWT_SECRET, { expiresIn:'12h' });
+    res.cookie('ipm_owner_token', token, cookieOpts(12 * 60 * 60 * 1000));
     res.json({ token: token, role: 'owner' });
   } catch(e) {
     res.status(500).json({ error: 'Token error: ' + e.message });
   }
+});
+
+app.post('/api/owner/logout', function(req, res) {
+  res.clearCookie('ipm_owner_token', { path: '/' });
+  res.json({ ok: true });
 });
 
 // ── OWNER: GET ALL CLIENTS ────────────────────────────
@@ -443,10 +532,10 @@ app.get('/api/owner/payments', ownerMiddleware, async function(req, res) {
 });
 
 // ── CLIENT LOGIN ──────────────────────────────────────
-app.post('/api/auth/login', async function(req, res) {
+app.post('/api/auth/login', loginLimiter, async function(req, res) {
   var username = (req.body.username || '').trim();
   var password = req.body.password || '';
-  var secret = process.env.JWT_SECRET || 'IPMControl2026DefaultSecret';
+  var secret = JWT_SECRET;
   try {
     var p = getPool();
     if (!p) return res.status(500).json({ error: 'Database not configured' });
@@ -465,6 +554,7 @@ app.post('/api/auth/login', async function(req, res) {
       );
       var safe = Object.assign({}, client);
       delete safe.password_hash;
+      res.cookie('ipm_token', token, cookieOpts(24 * 60 * 60 * 1000));
       return res.json({ token: token, client: safe, expired: days <= 0 });
     }
 
@@ -493,6 +583,7 @@ app.post('/api/auth/login', async function(req, res) {
                 full_name: pu.full_name },
               secret, { expiresIn: '24h' }
             );
+            res.cookie('ipm_token', portalToken, cookieOpts(24 * 60 * 60 * 1000));
             return res.json({
               token: portalToken,
               client: {
@@ -536,6 +627,7 @@ app.post('/api/auth/login', async function(req, res) {
       secret, { expiresIn: '24h' }
     );
 
+    res.cookie('ipm_token', userToken, cookieOpts(24 * 60 * 60 * 1000));
     return res.json({
       token: userToken,
       client: {
@@ -559,6 +651,11 @@ app.post('/api/auth/login', async function(req, res) {
     console.error('Login error:', e.message);
     res.status(500).json({ error: 'Login failed: ' + e.message });
   }
+});
+
+app.post('/api/auth/logout', function(req, res) {
+  res.clearCookie('ipm_token', { path: '/' });
+  res.json({ ok: true });
 });
 
 // ── CLIENT: ME ────────────────────────────────────────
@@ -941,7 +1038,7 @@ function portalMiddleware(req, res, next) {
   var token = auth.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
   try {
-    var decoded = jwt.verify(token, process.env.JWT_SECRET || 'IPMControl2026Secret');
+    var decoded = jwt.verify(token, JWT_SECRET);
     if (decoded.user_type !== 'portal_user') return res.status(403).json({ error: 'Portal access only' });
     req.user = decoded;
     next();
@@ -2094,9 +2191,9 @@ app.delete('/api/client/documents/:id', authMiddleware, mainAccountOnly, async f
 app.listen(PORT, '0.0.0.0', function() {
   console.log('');
   console.log('IPM Control API started on port ' + PORT);
-  console.log('OWNER_EMAIL:    ' + (process.env.OWNER_EMAIL    ? process.env.OWNER_EMAIL    : 'NOT SET - login will fail'));
-  console.log('OWNER_PASSWORD: ' + (process.env.OWNER_PASSWORD ? '*** set ***'               : 'NOT SET - login will fail'));
-  console.log('JWT_SECRET:     ' + (process.env.JWT_SECRET     ? '*** set ***'               : 'using default'));
+  console.log('OWNER_EMAIL:    ' + (process.env.OWNER_EMAIL    ? 'SET'       : 'NOT SET - login will fail'));
+  console.log('OWNER_PASSWORD: ' + (process.env.OWNER_PASSWORD ? '*** set ***' : 'NOT SET - login will fail'));
+  console.log('JWT_SECRET:     ' + (process.env.JWT_SECRET     ? '*** set ***' : 'using insecure dev fallback'));
   console.log('DATABASE_URL:        ' + (process.env.DATABASE_URL        ? 'SET' : 'not set'));
   console.log('DATABASE_PUBLIC_URL: ' + (process.env.DATABASE_PUBLIC_URL ? 'SET' : 'not set'));
   console.log('ACTIVE DB:           ' + (process.env.DATABASE_URL||process.env.DATABASE_PUBLIC_URL ? 'CONNECTED' : 'NONE - DB WILL FAIL'));
