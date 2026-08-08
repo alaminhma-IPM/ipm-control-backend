@@ -101,7 +101,13 @@ var owner2faLimiter = rateLimit({
 // (Railway) are different origins — 'strict'/'lax' would silently block the
 // cookie from ever being sent cross-site.
 function cookieOpts(maxAgeMs) {
-  return { httpOnly: true, secure: true, sameSite: 'none', maxAge: maxAgeMs, path: '/' };
+  // 'lax' now that the frontend proxies API calls through its own origin
+  // (see the frontend's _redirects file) rather than calling Railway
+  // directly cross-site. This is both safer than 'none' (real CSRF
+  // protection) and more reliable on mobile — browsers with tracking
+  // protection (Samsung Internet, iOS Safari) silently drop SameSite=None
+  // cookies on later requests even after initially accepting them.
+  return { httpOnly: true, secure: true, sameSite: 'lax', maxAge: maxAgeMs, path: '/' };
 }
 
 // ── DATABASE ──────────────────────────────────────────
