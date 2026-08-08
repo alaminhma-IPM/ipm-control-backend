@@ -554,6 +554,13 @@ app.post('/api/auth/login', loginLimiter, async function(req, res) {
       );
       var safe = Object.assign({}, client);
       delete safe.password_hash;
+      // Match what GET /api/client/me returns for this role — without this, the
+      // frontend's isPestControlAdmin() check (which requires user_type === 'client_main'
+      // exactly) fails on first login because the raw `clients` row has no user_type
+      // column, and the user briefly sees the full unrestricted dashboard instead of
+      // the pest-control admin console until they refresh and /client/me corrects it.
+      safe.user_type = 'client_main';
+      safe.company_id = null;
       res.cookie('ipm_token', token, cookieOpts(24 * 60 * 60 * 1000));
       return res.json({ token: token, client: safe, expired: days <= 0 });
     }
